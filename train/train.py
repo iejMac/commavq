@@ -46,7 +46,7 @@ if  __name__ == "__main__":
     '''
 
     # Logging
-    enable_wandb = False
+    enable_wandb = True
 
     if enable_wandb:
         wandb.init(
@@ -59,7 +59,7 @@ if  __name__ == "__main__":
     spatial_embeddings.requires_grad = False
 
     batch_size = 64
-    n_frames = 2
+    n_frames = 20
     dataloader = TokenLoader('commavq-mini.npy', batch_size, n_frames=n_frames)
 
     # Model Prep
@@ -100,8 +100,17 @@ if  __name__ == "__main__":
     for X in dataloader:
         if i >= iters:
             break
-        X = X.long().to(device)
 
+        # Set up the 0-k diff
+        k_fr_sample = torch.randint(1, n_frames, (batch_size, 1))
+        ax_0 = torch.arange(batch_size).reshape(-1, 1)
+
+        fr_0 = X[:, :1]
+        fr_k = X[ax_0, k_fr_sample]
+
+        X = torch.cat([fr_0, fr_k], axis=1)
+
+        X = X.long().to(device)
         data_time = time.time() - t0
 
         embs = spatial_embeddings[X].reshape(X.shape[0], X.shape[1], -1, spatial_embeddings.shape[-1])

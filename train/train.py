@@ -46,7 +46,7 @@ if  __name__ == "__main__":
     '''
 
     # Logging
-    enable_wandb = False
+    enable_wandb = True
 
     if enable_wandb:
         wandb.init(
@@ -81,16 +81,19 @@ if  __name__ == "__main__":
         n_input_tokens=N_DYNAMICS_TOKS + N_FRAME_TOKS + 2,
         spatial_embeddings=spatial_embeddings,
     ).to(device)
+    '''
     q = Quantizer(
         n_embeddings=128,
         embedding_dim=256,
         commitment_cost=0.25,
     ).to(device)
+    '''
 
     # Opt Prep
     iters = 10000000
 
-    opt = optim.AdamW(list(enc.parameters()) + list(dec.parameters()) + list(q.parameters()))
+    # opt = optim.AdamW(list(enc.parameters()) + list(dec.parameters()) + list(q.parameters()))
+    opt = optim.AdamW(list(enc.parameters()) + list(dec.parameters()))
 
     i = 0
     t0 = time.time()
@@ -121,7 +124,16 @@ if  __name__ == "__main__":
         # true_logits = logits[:, -N_FRAME_TOKS:]
 
         prep_logits, prep_labels = true_logits.reshape(-1, 1024), labels.reshape(-1)
-        reco_loss = F.cross_entropy(prep_logits, prep_labels)
+
+        # reco_loss = F.cross_entropy(prep_logits, prep_labels)
+        reco_loss = F.cross_entropy(prep_logits, prep_labels, reduction='none')
+
+        prep_x0_labels = X0.reshape(-1)
+        weights = torch.where(prep_labels == prep_x0_labels, 0.1, 1)
+
+        adjustment = weights.numel() / weights.sum()
+        reco_loss *= weights
+        reco_loss = reco_loss.mean() * adjustment  # so "loss mass" is the same
         # latent_loss = q.compute_latent_loss(f_emb, f)
         
         # loss = reco_loss + latent_loss
@@ -139,6 +151,7 @@ if  __name__ == "__main__":
             "perf/batch_time": batch_time,
         }
 
+        # Check if you're using f embedding
         with torch.no_grad():
             fake_f = torch.randn(f.shape).to(f.device)
             fake_logits = dec(e0, fake_f)

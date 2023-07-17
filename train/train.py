@@ -58,7 +58,7 @@ if  __name__ == "__main__":
     spatial_embeddings = torch.load("embedding.pt").to(device)
     spatial_embeddings.requires_grad = False
 
-    batch_size = 1
+    batch_size = 64
     n_frames = 2
     dataloader = TokenLoader('commavq-mini.npy', batch_size, n_frames=n_frames)
 
@@ -70,7 +70,7 @@ if  __name__ == "__main__":
         layers=8,
         heads=8,
         n_tokens=N_DYNAMICS_TOKS,
-        n_input_tokens=n_frames*128 + n_frames,
+        n_input_tokens=n_frames*N_FRAME_TOKS + n_frames,
         spatial_embeddings=spatial_embeddings,
     ).to(device)
     dec = Decoder(
@@ -94,7 +94,12 @@ if  __name__ == "__main__":
     iters = 10000000
 
     # opt = optim.AdamW(list(enc.parameters()) + list(dec.parameters()) + list(q.parameters()))
-    opt = optim.AdamW(list(enc.parameters()) + list(dec.parameters()))
+    opt = optim.AdamW(
+        list(enc.parameters()) + list(dec.parameters()),
+        lr=3e-3,
+        betas=(0.9, 0.98),
+        eps=1e-6,
+    )
 
     i = 0
     t0 = time.time()
@@ -128,7 +133,7 @@ if  __name__ == "__main__":
         prep_logits, prep_labels = true_logits.reshape(-1, 1024), labels.reshape(-1)
         reco_loss = F.cross_entropy(prep_logits, prep_labels)
         # latent_loss = q.compute_latent_loss(f_emb, f)
-        
+
         # loss = reco_loss + latent_loss
         # loss = latent_loss
         loss = reco_loss

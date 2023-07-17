@@ -97,7 +97,9 @@ class Decoder(nn.Module):
 
         update_logits = self.pred_head(y)
         update_dist = update_logits.softmax(dim=-1)
-        prior = (F.one_hot(x, num_classes=1024) * 0.99).softmax(dim=-1)  # temperature to soften up
+        # prior = (F.one_hot(x, num_classes=1024) * 0.99).softmax(dim=-1)  # temperature to soften up
+        prior = (F.one_hot(x, num_classes=1024) + torch.rand(update_dist.shape).to(x.device) * 1e-2 + 1e-6)
+        prior /= prior.sum(dim=-1, keepdims=True)
 
         posterior = prior * update_dist
         posterior /= posterior.sum(dim=-1, keepdims=True)
@@ -128,6 +130,7 @@ class Decoder(nn.Module):
         print(x)
         print(posterior.argmax(dim=-1))
         print((posterior.argmax(dim=-1) == x).sum() / x.numel())
+
         '''
         logits = post_logs
 

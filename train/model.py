@@ -70,6 +70,8 @@ class Decoder(nn.Module):
     def forward(self, x, f):
         # x: [b, 128, 256]; f: [b, s, 256]
 
+        x = self.spatial_embeddings[x]
+
         fx = torch.cat([
             x,
             self.frame_delim.to(x.dtype)  + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device),
@@ -129,3 +131,53 @@ class Quantizer(nn.Module):
         perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-10)))
         
         return quantized, perplexity, encoding_indices
+
+
+class VQVideo(nn.Module):
+    def __init__(self, n_dynamics_toks, n_frames, spatial_embeddings):
+        super().__init__()
+        self.encoder = Encoder(
+            width=256,
+            layers=8,
+            heads=8,
+            n_tokens=n_dynamics_toks,
+            n_input_tokens=n_frames*128 + n_frames,
+            spatial_embeddings=spatial_embeddings,
+        )
+        self.decoder = Decoder(
+            width=256,
+            layers=8,
+            heads=8,
+            n_tokens=n_dynamics_toks,
+            n_input_tokens=n_dynamics_toks + N_FRAME_TOKS + 2,
+            spatial_embeddings=spatial_embeddings,
+        )
+        '''
+        self.quantizer = Quantizer(
+            n_embeddings=128,
+            embedding_dim=256,
+            commitment_cost=0.25,
+        )
+        '''
+
+    def encode_diff(self, x):
+        return self.encoder(x)
+
+    def decode(self, x, f):
+        logits = self.decoder(x, f)
+        # TODO: why does this matter???
+        true_logits = logits[:, :N_FRAME_TOKS]  # for now only one frame
+        # true_logits = logits[:, -N_FRAME_TOKS:]
+        return true_logits
+
+    def forward(self, x):
+        f_emb = self.encode_diff(x)
+
+        # TODO: get AE to work then VAE then VQ-VAE
+        # f, ppl, encodings = q(f_emb)
+        f = f_emb
+
+        x0 = x[:, 0].reshape(x.shape[0], -1).long()
+        logits = self.decode(x0, f)
+
+        return logits

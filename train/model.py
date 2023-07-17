@@ -36,6 +36,8 @@ class Encoder(nn.Module):
         t_embs = embs + p_embs
 
         c_embs = self.transformer(t_embs)
+
+
         # TODO: WHY DOES THIS MATTER
         f = c_embs[:, :self.n_tokens]  # transformation is bottlenecked
         # f = c_embs[:, -self.n_tokens:]  # transformation is bottlenecked

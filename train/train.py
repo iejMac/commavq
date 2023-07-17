@@ -57,7 +57,7 @@ if  __name__ == "__main__":
     spatial_embeddings.requires_grad = False
 
     batch_size = 64
-    n_frames = 2
+    n_frames = 10
     n_dynamics_tokens = 64
     dataloader = TokenLoader('commavq-mini.npy', batch_size, n_frames=n_frames)
     # dataloader = TokenLoader('commavq.npy', batch_size, n_frames=n_frames)
@@ -83,7 +83,10 @@ if  __name__ == "__main__":
         if i >= iters:
             break
         X = X.long().to(device)
-        labels = X[:, 1:].reshape(X.shape[0], -1)
+
+        print(X.shape)
+        # TODO: what is this?
+        # labels = X[:, 1:].reshape(X.shape[0], -1)
 
         data_time = time.time() - t0
 

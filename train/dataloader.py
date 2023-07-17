@@ -32,7 +32,7 @@ if __name__ == "__main__":
     batch_size = 32
     n_frames = 5
 
-    tl = TokenLoader('commavq-mini.npy', batch_size, n_frames)
+    tl = TokenLoader('datasets/commavq-val.npy', batch_size, n_frames)
 
     t0 = time.time()
     i = 0

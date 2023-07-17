@@ -8,9 +8,10 @@ from torch import nn
 from torch.nn import functional as F
 from torch import optim
 
-from model import VQVideo, N_FRAME_TOKS
 from dataloader import TokenLoader
 from distributed import is_master, init_distributed_device
+from evaluate import compute_acc_metrics, compute_unused_f_loss, evaluate_model
+from model import VQVideo, N_FRAME_TOKS
 
 
 class AttrDict(dict):
@@ -53,33 +54,38 @@ if  __name__ == "__main__":
         )
 
     # Data Prep
+    eval_every_n_steps, validation_steps = 10, 10
+
+    batch_size = 16
+    n_frames = 2
+    n_dynamics_tokens = 64
+    train_dataloader = TokenLoader('datasets/commavq-mini.npy', batch_size, n_frames=n_frames)
+    # train_dataloader = TokenLoader('datasets/commavq-train.npy', batch_size, n_frames=n_frames)
+    val_dataloader = TokenLoader('datasets/commavq-val.npy', batch_size, n_frames=n_frames)
+
+    # Model Prep
     spatial_embeddings = torch.load("embedding.pt").to(device)
     spatial_embeddings.requires_grad = False
 
-    batch_size = 64
-    n_frames = 2
-    n_dynamics_tokens = 64
-    dataloader = TokenLoader('commavq-mini.npy', batch_size, n_frames=n_frames)
-    # dataloader = TokenLoader('commavq.npy', batch_size, n_frames=n_frames)
-
-    # Model Prep
     model = VQVideo(
         n_dynamics_toks = n_dynamics_tokens,
         n_frames = n_frames,
         spatial_embeddings = spatial_embeddings,
     ).to(device)
+    model.device = device
 
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[device])
 
     # Opt Prep
-    iters = 10000000
+    # iters = 10000000
+    iters = 100
 
     opt = optim.AdamW(model.parameters())
 
     i = 0
     t0 = time.time()
-    for X in dataloader:
+    for X in train_dataloader:
         if i >= iters:
             break
         X = X.long().to(device)
@@ -110,38 +116,22 @@ if  __name__ == "__main__":
             "perf/data_time": data_time,
             "perf/batch_time": batch_time,
             "perf/tokens_s_gpu": X.numel()/batch_time,
+            "train/reco_loss": reco_loss.item(),
         }
 
         # Check if you're using f embedding
-        x0 = X[:, 0].reshape(X.shape[0], -1).long()
         if is_master(args):
-            with torch.no_grad():
-                fake_f = torch.randn((batch_size, n_dynamics_tokens, 256)).to(device)
-                mod = model.module if args.distributed else model
-                fake_logits = mod.decode(x0, fake_f)
+            mod = model.module if args.distributed else model
+            unused_f_log = compute_unused_f_loss(mod, X)
+            log.update(unused_f_log)
 
-                fake_prep_logits = fake_logits.reshape(-1, 1024)
-                unused_f_loss = F.cross_entropy(fake_prep_logits, prep_labels)
-                log['train/unused_f_loss'] = unused_f_loss.item()
-    
+        acc_logs = compute_acc_metrics(true_logits.argmax(dim=-1), X, "train")
+        log.update(acc_logs)
 
-        pred = true_logits.argmax(dim=-1)
-        x0 = x0
-        x1 = labels 
-        pred_eq_x0 = (pred == x0)
-        pred_eq_x1 = (pred == x1)
-        x0_eq_x1 = (x0 == x1)
-
-        pred_x0_acc = (pred_eq_x0).sum()/x0.numel()
-        pred_x1_acc = (pred_eq_x1).sum()/x1.numel()
-        pred_x1_n_x0_acc = (pred_eq_x1 * ~(x0_eq_x1)).sum()/x1.numel()
-        x0_x1_eq = (x0_eq_x1).sum()/x1.numel()
-
-        log["train/reco_loss"] = reco_loss.item()
-        log["train/pred_x0_acc"] = pred_x0_acc.item()
-        log["train/pred_x1_acc"] = pred_x1_acc.item()
-        log["train/pred_x1_n_x0_acc"] = pred_x1_n_x0_acc.item()
-        log["train/x0_x1_eq"] = x0_x1_eq.item()
+        if (i+1) % eval_every_n_steps == 0:
+            mod = model.module if args.distributed else model
+            val_log = evaluate_model(mod, val_dataloader, validation_steps)
+            log.update(val_log)
 
         if is_master(args):
             print(f"Step {i}")
@@ -153,22 +143,3 @@ if  __name__ == "__main__":
 
         i += 1
         t0 = time.time()
-
-    last_pred = pred[0]
-    last_x0 = x0[0]
-    last_x1 = x1[0]
-
-    print('====== X0')
-    print(last_x0)
-    print('====== X1')
-    print(last_x1)
-    print('====== PRED')
-    print(last_pred)
-    print('======')
-    print("pred - x0")
-    print((last_pred == last_x0).sum()/last_x0.numel())
-    print("pred - x1")
-    print((last_pred == last_x1).sum()/last_x1.numel())
-    print("x0 - x1")
-    print((last_x0 == last_x1).sum()/last_x1.numel())
-

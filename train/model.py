@@ -139,6 +139,9 @@ class Quantizer(nn.Module):
 class VQVideo(nn.Module):
     def __init__(self, n_dynamics_toks, n_frames, spatial_embeddings):
         super().__init__()
+        self.n_dynamics_tokens = n_dynamics_toks
+        self.n_frames = n_frames
+
         self.encoder = Encoder(
             width=256,
             layers=8,

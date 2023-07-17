@@ -46,7 +46,7 @@ if  __name__ == "__main__":
     '''
 
     # Logging
-    enable_wandb = False
+    enable_wandb = True
 
     if enable_wandb:
         wandb.init(
@@ -70,7 +70,7 @@ if  __name__ == "__main__":
         layers=8,
         heads=8,
         n_tokens=N_DYNAMICS_TOKS,
-        n_input_tokens=n_frames*128 + n_frames,
+        n_input_tokens=n_frames*N_FRAME_TOKS + n_frames,
         spatial_embeddings=spatial_embeddings,
     ).to(device)
     dec = Decoder(
@@ -78,7 +78,8 @@ if  __name__ == "__main__":
         layers=8,
         heads=8,
         n_tokens=N_DYNAMICS_TOKS,
-        n_input_tokens=N_DYNAMICS_TOKS + N_FRAME_TOKS + 2,
+        # n_input_tokens=N_DYNAMICS_TOKS + N_FRAME_TOKS + 2,
+        n_input_tokens=N_FRAME_TOKS,
         spatial_embeddings=spatial_embeddings,
     ).to(device)
     '''
@@ -93,7 +94,12 @@ if  __name__ == "__main__":
     iters = 10000000
 
     # opt = optim.AdamW(list(enc.parameters()) + list(dec.parameters()) + list(q.parameters()))
-    opt = optim.AdamW(list(enc.parameters()) + list(dec.parameters()))
+    opt = optim.AdamW(
+        list(enc.parameters()) + list(dec.parameters()),
+        lr=3e-3,
+        betas=(0.9, 0.98),
+        eps=1e-6,
+    )
 
     i = 0
     t0 = time.time()
@@ -117,7 +123,8 @@ if  __name__ == "__main__":
         # f, ppl, encodings = q(f_emb)
         f = f_emb
 
-        logits = dec(e0, f)
+        # logits = dec(e0, f)
+        logits = dec(X0, f)
 
         # TODO: why does this matter???
         true_logits = logits[:, :N_FRAME_TOKS]
@@ -126,7 +133,7 @@ if  __name__ == "__main__":
         prep_logits, prep_labels = true_logits.reshape(-1, 1024), labels.reshape(-1)
         reco_loss = F.cross_entropy(prep_logits, prep_labels)
         # latent_loss = q.compute_latent_loss(f_emb, f)
-        
+
         # loss = reco_loss + latent_loss
         # loss = latent_loss
         loss = reco_loss
@@ -145,7 +152,8 @@ if  __name__ == "__main__":
         # Check if you're using f embedding
         with torch.no_grad():
             fake_f = torch.randn(f.shape).to(f.device)
-            fake_logits = dec(e0, fake_f)
+            # fake_logits = dec(e0, fake_f)
+            fake_logits = dec(X0, fake_f)
 
             fake_logits = fake_logits[:, :N_FRAME_TOKS]
             fake_prep_logits = fake_logits.reshape(-1, 1024)

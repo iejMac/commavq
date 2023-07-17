@@ -25,38 +25,6 @@ class AttrDict(dict):
 
 
 if  __name__ == "__main__":
-    '''
-    num_proc = 40 # CPUs go brrrr
-    ds = load_dataset('commaai/commavq', num_proc=num_proc)
-
-
-    tokens = np.load(ds['0'][0]['path']) # first segment from the first data shard
-    '''
-    # Input: [b, 2, N_FRAME_TOKS]
-    # Flattened: [b, 256]
-
-    # Bottleneck: [b, N_FRAME_TOKS + s] : s < 128 n Bottleneck[:128] = Input[:128]
-    # I.e. Transformation_Code = Encoder(Input): [b, s]
-    #      Output = Decoder(Input[:N_FRAME_TOKS] + Transformation_Code): [b, 128]
-
-    # Output: [b, 2, N_FRAME_TOKS]
-
-    '''
-    For now try to get results with constant bottleneck
-    i.e. try to get some encoder model that can encode the diffs in 50% less tokens
-
-    Next try variable length codings based on difference between tokens of frames
-    Need to add delimiter tokens <|X1|> abcd <|F|> 12 <|X2>| xzyw <|EOT|> pad pad pad 
-
-
-    Current Objective:
-        Get the model to learn the spatial embedding table by passing it through the dynamics
-        bottleneck
-
-        N_DYN_TOKS == N_SPATIAL_TOKS
-
-    '''
-
     args = AttrDict(
         dist_backend="nccl",
         dist_url="env://",
@@ -77,7 +45,7 @@ if  __name__ == "__main__":
     '''
 
     # Logging
-    enable_wandb = True and is_master(args)
+    enable_wandb = False and is_master(args)
 
     if enable_wandb:
         wandb.init(
@@ -88,7 +56,7 @@ if  __name__ == "__main__":
     spatial_embeddings = torch.load("embedding.pt").to(device)
     spatial_embeddings.requires_grad = False
 
-    batch_size = 16
+    batch_size = 64
     n_frames = 2
     n_dynamics_tokens = 64
     dataloader = TokenLoader('commavq-mini.npy', batch_size, n_frames=n_frames)
@@ -160,13 +128,19 @@ if  __name__ == "__main__":
         pred = true_logits.argmax(dim=-1)
         x0 = x0
         x1 = labels 
-        pred_x0_acc = (pred == x0).sum()/x0.numel()
-        pred_x1_acc = (pred == x1).sum()/x1.numel()
-        x0_x1_eq = (x0 == x1).sum()/x1.numel()
+        pred_eq_x0 = (pred == x0)
+        pred_eq_x1 = (pred == x1)
+        x0_eq_x1 = (x0 == x1)
+
+        pred_x0_acc = (pred_eq_x0).sum()/x0.numel()
+        pred_x1_acc = (pred_eq_x1).sum()/x1.numel()
+        pred_x1_n_x0_acc = (pred_eq_x1 * ~(x0_eq_x1)).sum()/x1.numel()
+        x0_x1_eq = (x0_eq_x1).sum()/x1.numel()
 
         log["train/reco_loss"] = reco_loss.item()
         log["train/pred_x0_acc"] = pred_x0_acc.item()
         log["train/pred_x1_acc"] = pred_x1_acc.item()
+        log["train/pred_x1_n_x0_acc"] = pred_x1_n_x0_acc.item()
         log["train/x0_x1_eq"] = x0_x1_eq.item()
 
         if is_master(args):

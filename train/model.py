@@ -16,8 +16,8 @@ class Encoder(nn.Module):
         self.transformer = Transformer(width, layers, heads)
         self.n_tokens = n_tokens
 
-        # TODO:  scale = width ** -0.5
-        self.frame_delim = nn.Parameter(torch.randn(width)) # * scale
+        scale = width ** -0.5
+        self.frame_delim = nn.Parameter(torch.randn(width) * scale)
 
         self.pos_emb = nn.Embedding(n_input_tokens, width)
         self.register_buffer('spatial_embeddings', spatial_embeddings, persistent=False)
@@ -49,8 +49,8 @@ class Decoder(nn.Module):
         # TODO: weight tying here? 
         self.pred_head = nn.Linear(width, 1024, bias=False)
 
-        # TODO:  scale = width ** -0.5
-        self.frame_delim = nn.Parameter(torch.randn(width)) # * scale
+        scale = width ** -0.5
+        self.frame_delim = nn.Parameter(torch.randn(width) * scale)
         self.pos_emb = nn.Embedding(n_input_tokens, width)
 
         full_attn_mask = self.build_attention_mask(2 * N_FRAME_TOKS + n_tokens)

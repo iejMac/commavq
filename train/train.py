@@ -44,9 +44,8 @@ if  __name__ == "__main__":
 
     # Logging
     enable_wandb = True and is_master(args)
-    # eval_every_n_steps, validation_steps = 1000, 100
-    eval_every_n_steps, validation_steps = -1, 100
-    save_checkpoint_n_steps = 10000
+    eval_every_n_steps, validation_steps = 1000, 100
+    save_checkpoint_n_steps = 5000
 
     if enable_wandb:
         wandb.init(
@@ -57,8 +56,8 @@ if  __name__ == "__main__":
     batch_size = 32
     n_frames = 2
     n_dynamics_tokens = 32
-    # train_dataloader = TokenLoader('datasets/commavq-mini.npy', batch_size, n_frames=n_frames)
-    train_dataloader = TokenLoader('datasets/commavq-train.npy', batch_size, n_frames=n_frames)
+    train_dataloader = TokenLoader('datasets/commavq-mini.npy', batch_size, n_frames=n_frames)
+    # train_dataloader = TokenLoader('datasets/commavq-train.npy', batch_size, n_frames=n_frames)
     val_dataloader = TokenLoader('datasets/commavq-val.npy', batch_size, n_frames=n_frames)
 
     # Model Prep

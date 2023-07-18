@@ -70,7 +70,7 @@ def evaluate_model(model, val_dataloader, n_steps):
             X = X.long().to(model.device)
             labels = X[:, 1:].reshape(X.shape[0], -1)
 
-            true_logits = model(X)
+            true_logits, latent_info = model(X)
             prep_logits, prep_labels = true_logits.reshape(-1, 1024), labels.reshape(-1)
             reco_loss = F.cross_entropy(prep_logits, prep_labels)
             step_log["val/reco_loss"] = reco_loss.item()

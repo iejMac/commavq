@@ -136,13 +136,6 @@ class Quantizer(nn.Module):
         self.embedding = nn.Embedding(n_embeddings, embedding_dim)
         self.embedding.weight.data.uniform_(-1/n_embeddings, 1/self.n_embeddings)
 
-    def compute_latent_loss(self, f_emb, quantized):
-        # Loss
-        e_latent_loss = F.mse_loss(quantized.detach(), f_emb)
-        q_latent_loss = F.mse_loss(quantized, f_emb.detach())
-        loss = q_latent_loss + self.commitment_cost * e_latent_loss
-        return loss
-
     def forward(self, f_emb):
         flat_input = f_emb.reshape(-1, self.embedding_dim)
         # Calculate distances
@@ -157,12 +150,16 @@ class Quantizer(nn.Module):
         
         # Quantize and unflatten
         quantized = torch.matmul(encodings, self.embedding.weight).reshape(f_emb.shape)
+
+        e_latent_loss = F.mse_loss(quantized.detach(), f_emb)
+        q_latent_loss = F.mse_loss(quantized, f_emb.detach())
+        latent_loss = q_latent_loss + self.commitment_cost * e_latent_loss
         
         quantized = f_emb + (quantized - f_emb).detach()
         avg_probs = torch.mean(encodings, dim=0)
         perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-10)))
         
-        return quantized, perplexity, encoding_indices
+        return quantized, latent_loss, perplexity, encoding_indices
 
 
 class VQVideo(nn.Module):
@@ -187,13 +184,11 @@ class VQVideo(nn.Module):
             n_input_tokens=n_dynamics_toks + N_FRAME_TOKS + 2,
             spatial_embeddings=spatial_embeddings,
         )
-        '''
         self.quantizer = Quantizer(
             n_embeddings=128,
             embedding_dim=256,
             commitment_cost=0.25,
         )
-        '''
 
     def encode_diff(self, x):
         return self.encoder(x)
@@ -209,11 +204,10 @@ class VQVideo(nn.Module):
     def forward(self, x):
         f_emb = self.encode_diff(x)
 
-        # TODO: get AE to work then VAE then VQ-VAE
-        # f, ppl, encodings = q(f_emb)
-        f = f_emb
+        f, latent_loss, ppl, encodings = self.quantizer(f_emb)
+        latent_info = {'latent_loss': latent_loss, 'perplexity': ppl, 'encodings': encodings}
 
         x0 = x[:, 0].reshape(x.shape[0], -1).long()
         logits = self.decode(x0, f)
 
-        return logits
+        return logits, latent_info

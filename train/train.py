@@ -44,7 +44,7 @@ if  __name__ == "__main__":
 
     # Logging
     enable_wandb = True and is_master(args)
-    eval_every_n_steps, validation_steps = 1000, 100
+    eval_every_n_steps, validation_steps = 5000, 100
     save_checkpoint_n_steps = 5000
 
     if enable_wandb:
@@ -55,7 +55,7 @@ if  __name__ == "__main__":
     # Data Prep
     batch_size = 32
     n_frames = 2
-    n_dynamics_tokens = 32
+    n_dynamics_tokens = 64
     train_dataloader = TokenLoader('datasets/commavq-mini.npy', batch_size, n_frames=n_frames)
     # train_dataloader = TokenLoader('datasets/commavq-train.npy', batch_size, n_frames=n_frames)
     val_dataloader = TokenLoader('datasets/commavq-val.npy', batch_size, n_frames=n_frames)
@@ -98,18 +98,17 @@ if  __name__ == "__main__":
         # Forward pass
         opt.zero_grad()
 
-        true_logits = model(X)
+        true_logits, latent_info = model(X)
 
         prep_logits, prep_labels = true_logits.reshape(-1, 1024), labels.reshape(-1)
         reco_loss = F.cross_entropy(prep_logits, prep_labels)
-        # latent_loss = model.compute_latent_loss(f_emb, f)
+        latent_loss = latent_info['latent_loss']
         
-        # loss = reco_loss + latent_loss
-        # loss = latent_loss
-        loss = reco_loss
+        loss = reco_loss + latent_loss
 
         loss.backward()
 
+        '''
         # Clip gradients
         if grad_clip_norm != -1:
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm, norm_type=2.0)
@@ -121,6 +120,8 @@ if  __name__ == "__main__":
             ]),
             2.0,
         )
+        '''
+        grad_norm = torch.tensor(0.0)
 
         opt.step()
 
@@ -132,6 +133,8 @@ if  __name__ == "__main__":
             "perf/batch_time": batch_time,
             "perf/tokens_s_gpu": X.numel()/batch_time,
             "train/reco_loss": reco_loss.item(),
+            "train/latent_loss": latent_loss.item(),
+            "train/perplexity": latent_info['perplexity'].item(),
             "train/grad_norm": grad_norm.item(),
         }
 

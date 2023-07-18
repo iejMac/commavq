@@ -71,8 +71,6 @@ class Decoder(nn.Module):
         return mask
         
     def forward(self, x, f):
-        # x: [b, 128, 256]; f: [b, s, 256]
-
         x = self.spatial_embeddings[x]
 
         fx = torch.cat([
@@ -81,7 +79,6 @@ class Decoder(nn.Module):
             f,
             self.frame_delim.to(x.dtype)  + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device),
         ], dim=1)  # concat space code with transformation code
-        # fx = torch.cat([x, f], dim=1)
 
         pos = torch.arange(0, fx.shape[1], dtype=torch.long, device=x.device).unsqueeze(0) 
         p_embs = self.pos_emb(pos)

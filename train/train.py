@@ -10,7 +10,7 @@ from torch import optim
 
 from dataloader import TokenLoader
 from distributed import is_master, init_distributed_device
-from evaluate import compute_acc_metrics, compute_unused_f_loss, evaluate_model
+from evaluate import compute_acc_metrics, compute_usage_loss, evaluate_model
 from model import VQVideo, N_FRAME_TOKS
 
 
@@ -46,7 +46,7 @@ if  __name__ == "__main__":
     '''
 
     # Logging
-    enable_wandb = False and is_master(args)
+    enable_wandb = True and is_master(args)
 
     if enable_wandb:
         wandb.init(
@@ -54,13 +54,13 @@ if  __name__ == "__main__":
         )
 
     # Data Prep
-    eval_every_n_steps, validation_steps = 10, 10
+    eval_every_n_steps, validation_steps = 1000, 100
 
-    batch_size = 16
+    batch_size = 32
     n_frames = 2
-    n_dynamics_tokens = 64
-    train_dataloader = TokenLoader('datasets/commavq-mini.npy', batch_size, n_frames=n_frames)
-    # train_dataloader = TokenLoader('datasets/commavq-train.npy', batch_size, n_frames=n_frames)
+    n_dynamics_tokens = 2
+    # train_dataloader = TokenLoader('datasets/commavq-mini.npy', batch_size, n_frames=n_frames)
+    train_dataloader = TokenLoader('datasets/commavq-train.npy', batch_size, n_frames=n_frames)
     val_dataloader = TokenLoader('datasets/commavq-val.npy', batch_size, n_frames=n_frames)
 
     # Model Prep
@@ -78,8 +78,7 @@ if  __name__ == "__main__":
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[device])
 
     # Opt Prep
-    # iters = 10000000
-    iters = 100
+    iters = 10000000
 
     opt = optim.AdamW(model.parameters())
 
@@ -122,8 +121,8 @@ if  __name__ == "__main__":
         # Check if you're using f embedding
         if is_master(args):
             mod = model.module if args.distributed else model
-            unused_f_log = compute_unused_f_loss(mod, X)
-            log.update(unused_f_log)
+            usage_log = compute_usage_loss(mod, X)
+            log.update(usage_log)
 
         acc_logs = compute_acc_metrics(true_logits.argmax(dim=-1), X, "train")
         log.update(acc_logs)

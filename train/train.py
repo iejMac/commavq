@@ -34,8 +34,6 @@ if  __name__ == "__main__":
 
     device = init_distributed_device(args)
 
-    '''
-    # TODO: compare this
     if torch.cuda.is_available():
         # This enables tf32 on Ampere GPUs which is only 8% slower than
         # float16 and almost as accurate as float32
@@ -43,11 +41,11 @@ if  __name__ == "__main__":
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.benchmark = True
         torch.backends.cudnn.deterministic = False
-    '''
 
     # Logging
     enable_wandb = True and is_master(args)
-    eval_every_n_steps, validation_steps = 1000, 100
+    # eval_every_n_steps, validation_steps = 1000, 100
+    eval_every_n_steps, validation_steps = -1, 100
     save_checkpoint_n_steps = 10000
 
     if enable_wandb:
@@ -58,7 +56,7 @@ if  __name__ == "__main__":
     # Data Prep
     batch_size = 32
     n_frames = 2
-    n_dynamics_tokens = 16
+    n_dynamics_tokens = 32
     # train_dataloader = TokenLoader('datasets/commavq-mini.npy', batch_size, n_frames=n_frames)
     train_dataloader = TokenLoader('datasets/commavq-train.npy', batch_size, n_frames=n_frames)
     val_dataloader = TokenLoader('datasets/commavq-val.npy', batch_size, n_frames=n_frames)
@@ -79,8 +77,14 @@ if  __name__ == "__main__":
 
     # Opt Prep
     iters = 10000000
+    grad_clip_norm = 3
 
-    opt = optim.AdamW(model.parameters())
+    opt = optim.AdamW(
+        model.parameters(),
+        lr=3e-4,
+        betas=(0.9, 0.98),  # (0.9, 0.999)
+        eps=1e-6,  # 1e-8
+    )
 
     i = 0
     t0 = time.time()
@@ -106,6 +110,19 @@ if  __name__ == "__main__":
         loss = reco_loss
 
         loss.backward()
+
+        # Clip gradients
+        if grad_clip_norm != -1:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm, norm_type=2.0)
+        # Compute gradient norm
+        grad_norm = torch.norm(
+            torch.stack([
+                torch.norm(p.grad.detach(), 2.0).to(device)
+                for p in model.parameters()
+            ]),
+            2.0,
+        )
+
         opt.step()
 
         batch_time = time.time() - t0
@@ -116,6 +133,7 @@ if  __name__ == "__main__":
             "perf/batch_time": batch_time,
             "perf/tokens_s_gpu": X.numel()/batch_time,
             "train/reco_loss": reco_loss.item(),
+            "train/grad_norm": grad_norm.item(),
         }
 
         # Check if you're using f embedding
@@ -127,11 +145,11 @@ if  __name__ == "__main__":
         acc_logs = compute_acc_metrics(true_logits.argmax(dim=-1), X, "train")
         log.update(acc_logs)
 
-        if (i+1) % eval_every_n_steps == 0:
+        if (eval_every_n_steps != -1) and ((i+1) % eval_every_n_steps == 0):
             mod = model.module if args.distributed else model
             val_log = evaluate_model(mod, val_dataloader, validation_steps)
             log.update(val_log)
-        if (i+1) % save_checkpoint_n_steps == 0:
+        if (save_checkpoint_n_steps != -1) and ((i+1) % save_checkpoint_n_steps == 0):
             torch.save(model.state_dict(), 'latest_vq_video.pth')
 
         if is_master(args):

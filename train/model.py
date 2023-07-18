@@ -1,4 +1,5 @@
 import torch
+import math
 import numpy as np
 
 from torch import nn
@@ -21,6 +22,21 @@ class Encoder(nn.Module):
 
         self.pos_emb = nn.Embedding(n_input_tokens, width)
         self.register_buffer('spatial_embeddings', spatial_embeddings, persistent=False)
+
+        self.init_parameters()
+
+    def init_parameters(self):
+        nn.init.normal_(self.pos_emb.weight, std=0.01)
+
+        proj_std = (self.transformer.width ** -0.5) * ((2 * self.transformer.layers) ** -0.5)
+        attn_std = self.transformer.width ** -0.5
+        fc_std = (2 * self.transformer.width) ** -0.5
+        for block in self.transformer.resblocks:
+            nn.init.normal_(block.attn.in_proj_weight, std=attn_std)
+            nn.init.normal_(block.attn.out_proj.weight, std=proj_std)
+            nn.init.normal_(block.mlp.c_fc.weight, std=fc_std)
+            nn.init.normal_(block.mlp.c_proj.weight, std=proj_std)
+
     def forward(self, x):
         x = x.reshape(x.shape[0], x.shape[1], -1) # flatten representation
 
@@ -59,6 +75,22 @@ class Decoder(nn.Module):
         full_attn_mask = self.build_attention_mask(2 * N_FRAME_TOKS + n_tokens)
         # self.register_buffer('attn_mask', full_attn_mask, persistent=False)
         self.register_buffer('spatial_embeddings', spatial_embeddings, persistent=False)
+
+        self.init_parameters()
+
+    def init_parameters(self):
+        nn.init.normal_(self.pos_emb.weight, std=0.01)
+
+        proj_std = (self.transformer.width ** -0.5) * ((2 * self.transformer.layers) ** -0.5)
+        attn_std = self.transformer.width ** -0.5
+        fc_std = (2 * self.transformer.width) ** -0.5
+        for block in self.transformer.resblocks:
+            nn.init.normal_(block.attn.in_proj_weight, std=attn_std)
+            nn.init.normal_(block.attn.out_proj.weight, std=proj_std)
+            nn.init.normal_(block.mlp.c_fc.weight, std=fc_std)
+            nn.init.normal_(block.mlp.c_proj.weight, std=proj_std)
+
+        torch.nn.init.normal_(self.pred_head.weight, mean=0.0, std=0.02/math.sqrt(2*self.transformer.layers))
 
     def build_attention_mask(self, ctx_len):
         # lazily create causal attention mask, with full attention between the tokens

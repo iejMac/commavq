@@ -55,7 +55,7 @@ class Encoder(nn.Module):
         c_embs = self.transformer(t_embs)
         c_embs = c_embs.permute(1, 0, 2)  # LND -> NLD
 
-        # TODO: WHY DOES THIS MATTER
+        # TODO: very weakly matters but changes loss curve so I'll keep this
         f = c_embs[:, :self.n_tokens]  # transformation is bottlenecked
         # f = c_embs[:, -self.n_tokens:]  # transformation is bottlenecked
         return f
@@ -200,7 +200,8 @@ class VQVideo(nn.Module):
 
     def decode(self, x, f):
         logits = self.decoder(x, f)
-        # TODO: why does this matter???
+        # TODO: very weakly matters but changes loss curve so I'll keep this
+        # used to just not work for the second one, now it works fine
         true_logits = logits[:, :N_FRAME_TOKS]  # for now only one frame
         # true_logits = logits[:, -N_FRAME_TOKS:]
         return true_logits

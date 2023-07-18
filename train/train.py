@@ -47,6 +47,8 @@ if  __name__ == "__main__":
 
     # Logging
     enable_wandb = True and is_master(args)
+    eval_every_n_steps, validation_steps = 1000, 100
+    save_checkpoint_n_steps = 10000
 
     if enable_wandb:
         wandb.init(
@@ -54,11 +56,9 @@ if  __name__ == "__main__":
         )
 
     # Data Prep
-    eval_every_n_steps, validation_steps = 1000, 100
-
     batch_size = 32
     n_frames = 2
-    n_dynamics_tokens = 2
+    n_dynamics_tokens = 16
     # train_dataloader = TokenLoader('datasets/commavq-mini.npy', batch_size, n_frames=n_frames)
     train_dataloader = TokenLoader('datasets/commavq-train.npy', batch_size, n_frames=n_frames)
     val_dataloader = TokenLoader('datasets/commavq-val.npy', batch_size, n_frames=n_frames)
@@ -131,6 +131,8 @@ if  __name__ == "__main__":
             mod = model.module if args.distributed else model
             val_log = evaluate_model(mod, val_dataloader, validation_steps)
             log.update(val_log)
+        if (i+1) % save_checkpoint_n_steps == 0:
+            torch.save(model.state_dict(), 'latest_vq_video.pth')
 
         if is_master(args):
             print(f"Step {i}")

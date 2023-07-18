@@ -35,10 +35,10 @@ class Encoder(nn.Module):
 
         t_embs = embs + p_embs
 
-        # TODO: figure out why this permute is so important
         t_embs = t_embs.permute(1, 0, 2)  # NLD -> LND
         c_embs = self.transformer(t_embs)
         c_embs = c_embs.permute(1, 0, 2)  # LND -> NLD
+
         # TODO: WHY DOES THIS MATTER
         f = c_embs[:, :self.n_tokens]  # transformation is bottlenecked
         # f = c_embs[:, -self.n_tokens:]  # transformation is bottlenecked

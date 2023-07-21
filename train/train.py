@@ -56,8 +56,8 @@ if  __name__ == "__main__":
     batch_size = 32
     n_frames = 2
     n_dynamics_tokens = 64
-    train_dataloader = TokenLoader('datasets/commavq-mini.npy', batch_size, n_frames=n_frames)
-    # train_dataloader = TokenLoader('datasets/commavq-train.npy', batch_size, n_frames=n_frames)
+    # train_dataloader = TokenLoader('datasets/commavq-mini.npy', batch_size, n_frames=n_frames)
+    train_dataloader = TokenLoader('datasets/commavq-train.npy', batch_size, n_frames=n_frames)
     val_dataloader = TokenLoader('datasets/commavq-val.npy', batch_size, n_frames=n_frames)
 
     # Model Prep
@@ -108,7 +108,6 @@ if  __name__ == "__main__":
 
         loss.backward()
 
-        '''
         # Clip gradients
         if grad_clip_norm != -1:
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm, norm_type=2.0)
@@ -116,12 +115,10 @@ if  __name__ == "__main__":
         grad_norm = torch.norm(
             torch.stack([
                 torch.norm(p.grad.detach(), 2.0).to(device)
-                for p in model.parameters()
+                for p in model.parameters() if p.grad is not None
             ]),
             2.0,
         )
-        '''
-        grad_norm = torch.tensor(0.0)
 
         opt.step()
 

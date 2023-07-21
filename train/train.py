@@ -53,15 +53,15 @@ if  __name__ == "__main__":
         )
 
     # Data Prep
-    batch_size = 32
+    batch_size = 16
     n_frames = 2
     n_dynamics_tokens = 64
-    # train_dataloader = TokenLoader('datasets/commavq-mini.npy', batch_size, n_frames=n_frames)
-    train_dataloader = TokenLoader('datasets/commavq-train.npy', batch_size, n_frames=n_frames)
+    train_dataloader = TokenLoader('datasets/commavq-mini.npy', batch_size, n_frames=n_frames)
+    # train_dataloader = TokenLoader('datasets/commavq-train.npy', batch_size, n_frames=n_frames)
     val_dataloader = TokenLoader('datasets/commavq-val.npy', batch_size, n_frames=n_frames)
 
     # Model Prep
-    spatial_embeddings = torch.load("embedding.pt").to(device)
+    spatial_embeddings = torch.load("embedding.pt")
     spatial_embeddings.requires_grad = False
 
     model = VQVideo(

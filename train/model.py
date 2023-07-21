@@ -65,8 +65,11 @@ class Decoder(nn.Module):
     def __init__(self, width, layers, heads, n_tokens, n_input_tokens, spatial_embeddings):
         super().__init__()
         self.transformer = Transformer(width, layers, heads)
-        # TODO: weight tying here? 
         self.pred_head = nn.Linear(width, 1024, bias=False)
+        self.weight_tying = True
+        if self.weight_tying:
+            self.pred_head.weight = nn.Parameter(spatial_embeddings)
+            self.pred_head.requires_grad = False
 
         scale = width ** -0.5
         self.frame_delim = nn.Parameter(torch.randn(width) * scale)
@@ -97,6 +100,7 @@ class Decoder(nn.Module):
         # pytorch uses additive attention mask; fill with -inf
 
         # TODO: might need to build attn mask every time for dynamic stuff
+        # TODO: try out blocked attention masks (frame is atomic element)
         mask = torch.empty(ctx_len, ctx_len)
         mask.fill_(float("-inf"))
         mask.triu_(1)  # zero out the lower diagonal
@@ -244,7 +248,7 @@ class VQVideo(nn.Module):
 
         self.encoder = Encoder(
             width=256,
-            layers=12,
+            layers=8,
             heads=8,
             n_tokens=n_dynamics_toks,
             n_input_tokens=n_frames*128 + n_frames,
@@ -252,7 +256,7 @@ class VQVideo(nn.Module):
         )
         self.decoder = Decoder(
             width=256,
-            layers=12,
+            layers=8,
             heads=8,
             n_tokens=n_dynamics_toks,
             n_input_tokens=n_dynamics_toks + N_FRAME_TOKS + 2,

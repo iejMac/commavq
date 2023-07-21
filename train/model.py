@@ -65,8 +65,11 @@ class Decoder(nn.Module):
     def __init__(self, width, layers, heads, n_tokens, n_input_tokens, spatial_embeddings):
         super().__init__()
         self.transformer = Transformer(width, layers, heads)
-        # TODO: weight tying here? 
         self.pred_head = nn.Linear(width, 1024, bias=False)
+        self.weight_tying = True
+        if self.weight_tying:
+            self.pred_head.weight = nn.Parameter(spatial_embeddings)
+            self.pred_head.requires_grad = False
 
         scale = width ** -0.5
         self.frame_delim = nn.Parameter(torch.randn(width) * scale)
@@ -97,6 +100,7 @@ class Decoder(nn.Module):
         # pytorch uses additive attention mask; fill with -inf
 
         # TODO: might need to build attn mask every time for dynamic stuff
+        # TODO: try out blocked attention masks (frame is atomic element)
         mask = torch.empty(ctx_len, ctx_len)
         mask.fill_(float("-inf"))
         mask.triu_(1)  # zero out the lower diagonal
@@ -136,13 +140,6 @@ class Quantizer(nn.Module):
         self.embedding = nn.Embedding(n_embeddings, embedding_dim)
         self.embedding.weight.data.uniform_(-1/n_embeddings, 1/self.n_embeddings)
 
-    def compute_latent_loss(self, f_emb, quantized):
-        # Loss
-        e_latent_loss = F.mse_loss(quantized.detach(), f_emb)
-        q_latent_loss = F.mse_loss(quantized, f_emb.detach())
-        loss = q_latent_loss + self.commitment_cost * e_latent_loss
-        return loss
-
     def forward(self, f_emb):
         flat_input = f_emb.reshape(-1, self.embedding_dim)
         # Calculate distances
@@ -157,12 +154,90 @@ class Quantizer(nn.Module):
         
         # Quantize and unflatten
         quantized = torch.matmul(encodings, self.embedding.weight).reshape(f_emb.shape)
+
+        e_latent_loss = F.mse_loss(quantized.detach(), f_emb)
+        q_latent_loss = F.mse_loss(quantized, f_emb.detach())
+        latent_loss = q_latent_loss + self.commitment_cost * e_latent_loss
         
         quantized = f_emb + (quantized - f_emb).detach()
         avg_probs = torch.mean(encodings, dim=0)
         perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-10)))
         
-        return quantized, perplexity, encoding_indices
+        return quantized, latent_loss, perplexity, encoding_indices
+
+
+class QuantizerEMA(nn.Module):
+    def __init__(self, n_embeddings, embedding_dim, commitment_cost, decay, epsilon=1e-5):
+        super(QuantizerEMA, self).__init__()
+        
+        self._embedding_dim = embedding_dim
+        self._n_embeddings = n_embeddings
+        
+        self._embedding = nn.Embedding(self._n_embeddings, self._embedding_dim)
+        self._embedding.weight.data.normal_()
+        # TODO: not sure if this is the right way to solve DDP issues:
+        self._embedding.weight.requires_grad=False
+        self._commitment_cost = commitment_cost
+        
+        self.register_buffer('_ema_cluster_size', torch.zeros(n_embeddings))
+        self._ema_w = nn.Parameter(torch.Tensor(n_embeddings, self._embedding_dim))
+        self._ema_w.data.normal_()
+        # TODO: not sure if this is the right way to solve DDP issues:
+        self._ema_w.requires_grad = False
+        
+        self._decay = decay
+        self._epsilon = epsilon
+
+    def forward(self, inputs):
+        # convert inputs from BCHW -> BHWC
+        input_shape = inputs.shape
+        
+        # Flatten input
+        flat_input = inputs.reshape(-1, self._embedding_dim)
+        
+        # Calculate distances
+        distances = (torch.sum(flat_input**2, dim=1, keepdim=True) 
+                    + torch.sum(self._embedding.weight**2, dim=1)
+                    - 2 * torch.matmul(flat_input, self._embedding.weight.t()))
+            
+        # Encoding
+        encoding_indices = torch.argmin(distances, dim=1).unsqueeze(1)
+        encodings = torch.zeros(encoding_indices.shape[0], self._n_embeddings, device=inputs.device)
+        encodings.scatter_(1, encoding_indices, 1)
+        
+        # Quantize and unflatten
+        quantized = torch.matmul(encodings, self._embedding.weight).reshape(input_shape)
+        
+        # Use EMA to update the embedding vectors
+        if self.training:
+            self._ema_cluster_size = self._ema_cluster_size * self._decay + \
+                                     (1 - self._decay) * torch.sum(encodings, 0)
+            
+            # Laplace smoothing of the cluster size
+            n = torch.sum(self._ema_cluster_size.data)
+            self._ema_cluster_size = (
+                (self._ema_cluster_size + self._epsilon)
+                / (n + self._n_embeddings * self._epsilon) * n)
+            
+            dw = torch.matmul(encodings.t(), flat_input)
+            self._ema_w = nn.Parameter(self._ema_w * self._decay + (1 - self._decay) * dw)
+            # TODO: not sure if this is the right way to solve DDP issues:
+            self._ema_w.requires_grad = False
+            
+            self._embedding.weight = nn.Parameter(self._ema_w / self._ema_cluster_size.unsqueeze(1))
+            # TODO: not sure if this is the right way to solve DDP issues:
+            self._embedding.weight.requires_grad=False
+        
+        # Loss
+        e_latent_loss = F.mse_loss(quantized.detach(), inputs)
+        latent_loss = self._commitment_cost * e_latent_loss
+        
+        # Straight Through Estimator
+        quantized = inputs + (quantized - inputs).detach()
+        avg_probs = torch.mean(encodings, dim=0)
+        perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-10)))
+        
+        return quantized, latent_loss, perplexity, encoding_indices
 
 
 class VQVideo(nn.Module):
@@ -187,11 +262,17 @@ class VQVideo(nn.Module):
             n_input_tokens=n_dynamics_toks + N_FRAME_TOKS + 2,
             spatial_embeddings=spatial_embeddings,
         )
-        '''
         self.quantizer = Quantizer(
-            n_embeddings=128,
+            n_embeddings=1024,
             embedding_dim=256,
             commitment_cost=0.25,
+        )
+        '''
+        self.quantizer = QuantizerEMA(
+            n_embeddings=1024,
+            embedding_dim=256,
+            commitment_cost=0.25,
+            decay=0.99,
         )
         '''
 
@@ -209,11 +290,10 @@ class VQVideo(nn.Module):
     def forward(self, x):
         f_emb = self.encode_diff(x)
 
-        # TODO: get AE to work then VAE then VQ-VAE
-        # f, ppl, encodings = q(f_emb)
-        f = f_emb
+        f, latent_loss, ppl, encodings = self.quantizer(f_emb)
+        latent_info = {'latent_loss': latent_loss, 'perplexity': ppl, 'encodings': encodings}
 
         x0 = x[:, 0].reshape(x.shape[0], -1).long()
         logits = self.decode(x0, f)
 
-        return logits
+        return logits, latent_info

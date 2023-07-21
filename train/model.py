@@ -258,7 +258,6 @@ class VQVideo(nn.Module):
             n_input_tokens=n_dynamics_toks + N_FRAME_TOKS + 2,
             spatial_embeddings=spatial_embeddings,
         )
-        '''
         self.quantizer = Quantizer(
             n_embeddings=1024,
             embedding_dim=256,
@@ -271,6 +270,7 @@ class VQVideo(nn.Module):
             commitment_cost=0.25,
             decay=0.99,
         )
+        '''
 
     def encode_diff(self, x):
         return self.encoder(x)

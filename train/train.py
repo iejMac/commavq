@@ -76,7 +76,7 @@ if  __name__ == "__main__":
 
     # Opt Prep
     iters = 10000000
-    grad_clip_norm = -1
+    grad_clip_norm = 3
 
     opt = optim.AdamW(
         model.parameters(),
@@ -119,7 +119,6 @@ if  __name__ == "__main__":
             ]),
             2.0,
         )
-        # grad_norm = torch.tensor(0.0).to(device)
 
         opt.step()
 

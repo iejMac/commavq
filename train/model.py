@@ -38,12 +38,8 @@ class Encoder(nn.Module):
         self.pos_emb = nn.Embedding(n_input_tokens, width)
         self.output_dim = width if output_dim == -1 else output_dim
 
-        hidden_size = (self.width + self.output_dim) // 2
-        self.proj = nn.Sequential(
-            nn.Linear(self.width, hidden_size, bias=False),
-            nn.GELU(),
-            nn.Linear(hidden_size, self.output_dim, bias=False),
-        )
+
+        self.proj = nn.Linear(self.width, self.output_dim, bias=False)
         self.init_parameters()
 
     def init_parameters(self):
@@ -214,17 +210,9 @@ class VQVideo(nn.Module):
 
         self.register_buffer('spatial_embeddings', spatial_embeddings, persistent=False)
 
-        hidden_size = (256 + self.width) // 2
-        self.frame_proj = nn.Sequential(
-            nn.Linear(256, hidden_size, bias=False),
-            nn.GELU(),
-            nn.Linear(hidden_size, self.width, bias=False),
-        )
-        self.diff_proj = nn.Sequential(
-            nn.Linear(quantizer_config.embedding_dim, hidden_size, bias=False),
-            nn.GELU(),
-            nn.Linear(hidden_size, self.width, bias=False),
-        )
+        self.frame_proj = nn.Linear(256, self.width, bias=False)
+        self.diff_proj = nn.Linear(quantizer_config.embedding_dim, self.width, bias=False)
+
 
         self.encoder = Encoder(
             width=encoder_config.width,

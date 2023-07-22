@@ -32,9 +32,9 @@ def compute_usage_loss(model, X, split="train"):
     prep_labels = X[:, 1:].reshape(X.shape[0], -1).reshape(-1)
     
     with torch.no_grad():
-        fake_f = torch.randn((X.shape[0], model.n_dynamics_tokens, 256)).to(X.device)
+        fake_f = torch.randn((X.shape[0], model.n_dynamics_tokens, model.width)).to(X.device)
         fake_x0 = torch.randint(0, 1024, x0.shape).long().to(X.device)
-        f = model.encode_diff(X)
+        f = model.diff_proj(model.encode_diff(X))
         fake_f_logits = model.decode(x0, fake_f)
         fake_x0_logits = model.decode(fake_x0, f)
 

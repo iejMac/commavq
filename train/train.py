@@ -45,6 +45,7 @@ if  __name__ == "__main__":
     # Logging
     enable_wandb = False and is_master(args)
     log_every_n_steps = 1
+    soft_eval_every_n_steps = 100
     eval_every_n_steps, validation_steps = 5000, 100
     save_checkpoint_n_steps = 5000
 
@@ -74,6 +75,7 @@ if  __name__ == "__main__":
         heads=8,
         n_input_tokens=2*N_FRAME_TOKENS + 2,
         n_dynamics_tokens=n_dynamics_tokens,
+        output_dim=quantized_width,
     )
     decoder_config = DecoderConfig(
         width=common_width,
@@ -165,19 +167,20 @@ if  __name__ == "__main__":
             "train/grad_norm": grad_norm.item(),
         }
 
+        # Evals
+        acc_logs = compute_acc_metrics(true_logits.argmax(dim=-1), X, "train")
+        log.update(acc_logs)
         # Check if you're using f embedding
-        if is_master(args):
+        if ((i+1) % soft_eval_every_n_steps == 0) and is_master(args):
             mod = model.module if args.distributed else model
             usage_log = compute_usage_loss(mod, X)
             log.update(usage_log)
-
-        acc_logs = compute_acc_metrics(true_logits.argmax(dim=-1), X, "train")
-        log.update(acc_logs)
-
         if (eval_every_n_steps != -1) and ((i+1) % eval_every_n_steps == 0):
             mod = model.module if args.distributed else model
             val_log = evaluate_model(mod, val_dataloader, validation_steps)
             log.update(val_log)
+
+        # Checkpointing
         if (save_checkpoint_n_steps != -1) and ((i+1) % save_checkpoint_n_steps == 0):
             torch.save(model.state_dict(), 'latest_vq_video.pth')
 

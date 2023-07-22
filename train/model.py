@@ -18,18 +18,32 @@ class EncoderConfig:
     heads: int = 8
     n_input_tokens: int = 2*N_FRAME_TOKENS + 2
     n_dynamics_tokens: int = 64
+    output_dim: int = -1
 
 class Encoder(nn.Module):
-    def __init__(self, width, layers, heads, n_input_tokens, n_dynamics_tokens):
+    def __init__(self, width, layers, heads, n_input_tokens, n_dynamics_tokens, output_dim):
         super().__init__()
-        self.transformer = Transformer(width, layers, heads)
+        self.width = width
+        self.layers = layers
+        self.heads = heads
+        self.n_input_tokens = n_input_tokens
         self.n_dynamics_tokens = n_dynamics_tokens
+        self.output_dim = output_dim
+
+        self.transformer = Transformer(width, layers, heads)
 
         scale = width ** -0.5
         self.frame_delim = nn.Parameter(torch.randn(width) * scale)
 
         self.pos_emb = nn.Embedding(n_input_tokens, width)
+        self.output_dim = width if output_dim == -1 else output_dim
 
+        hidden_size = (self.width + self.output_dim) // 2
+        self.proj = nn.Sequential(
+            nn.Linear(self.width, hidden_size, bias=False),
+            nn.GELU(),
+            nn.Linear(hidden_size, self.output_dim, bias=False),
+        )
         self.init_parameters()
 
     def init_parameters(self):
@@ -59,6 +73,8 @@ class Encoder(nn.Module):
         c_embs = self.transformer(t_embs)
         c_embs = c_embs.permute(1, 0, 2)  # LND -> NLD
 
+        c_embs = self.proj(c_embs)
+
         # TODO: very weakly matters but changes loss curve so I'll keep this
         f = c_embs[:, :self.n_dynamics_tokens]  # transformation is bottlenecked
         # f = c_embs[:, -self.n_dynamics_tokens:]  # transformation is bottlenecked
@@ -78,6 +94,13 @@ class DecoderConfig:
 class Decoder(nn.Module):
     def __init__(self, width, layers, heads, n_input_tokens, n_dynamics_tokens, weight_tying, spatial_embeddings=None):
         super().__init__()
+        self.width = width
+        self.layers = layers
+        self.heads = heads
+        self.n_input_tokens = n_input_tokens
+        self.n_dynamics_tokens = n_dynamics_tokens
+        self.weight_tying = weight_tying
+
         self.transformer = Transformer(width, layers, heads)
         self.pred_head = nn.Linear(width, 1024, bias=False)
         self.weight_tying = weight_tying
@@ -183,84 +206,10 @@ class Quantizer(nn.Module):
         return quantized, latent_loss, perplexity, encoding_indices
 
 
-class QuantizerEMA(nn.Module):
-    def __init__(self, n_embeddings, embedding_dim, commitment_cost, decay, epsilon=1e-5):
-        super(QuantizerEMA, self).__init__()
-        
-        self._embedding_dim = embedding_dim
-        self._n_embeddings = n_embeddings
-        
-        self._embedding = nn.Embedding(self._n_embeddings, self._embedding_dim)
-        self._embedding.weight.data.normal_()
-        # TODO: not sure if this is the right way to solve DDP issues:
-        self._embedding.weight.requires_grad=False
-        self._commitment_cost = commitment_cost
-        
-        self.register_buffer('_ema_cluster_size', torch.zeros(n_embeddings))
-        self._ema_w = nn.Parameter(torch.Tensor(n_embeddings, self._embedding_dim))
-        self._ema_w.data.normal_()
-        # TODO: not sure if this is the right way to solve DDP issues:
-        self._ema_w.requires_grad = False
-        
-        self._decay = decay
-        self._epsilon = epsilon
-
-    def forward(self, inputs):
-        # convert inputs from BCHW -> BHWC
-        input_shape = inputs.shape
-        
-        # Flatten input
-        flat_input = inputs.reshape(-1, self._embedding_dim)
-        
-        # Calculate distances
-        distances = (torch.sum(flat_input**2, dim=1, keepdim=True) 
-                    + torch.sum(self._embedding.weight**2, dim=1)
-                    - 2 * torch.matmul(flat_input, self._embedding.weight.t()))
-            
-        # Encoding
-        encoding_indices = torch.argmin(distances, dim=1).unsqueeze(1)
-        encodings = torch.zeros(encoding_indices.shape[0], self._n_embeddings, device=inputs.device)
-        encodings.scatter_(1, encoding_indices, 1)
-        
-        # Quantize and unflatten
-        quantized = torch.matmul(encodings, self._embedding.weight).reshape(input_shape)
-        
-        # Use EMA to update the embedding vectors
-        if self.training:
-            self._ema_cluster_size = self._ema_cluster_size * self._decay + \
-                                     (1 - self._decay) * torch.sum(encodings, 0)
-            
-            # Laplace smoothing of the cluster size
-            n = torch.sum(self._ema_cluster_size.data)
-            self._ema_cluster_size = (
-                (self._ema_cluster_size + self._epsilon)
-                / (n + self._n_embeddings * self._epsilon) * n)
-            
-            dw = torch.matmul(encodings.t(), flat_input)
-            self._ema_w = nn.Parameter(self._ema_w * self._decay + (1 - self._decay) * dw)
-            # TODO: not sure if this is the right way to solve DDP issues:
-            self._ema_w.requires_grad = False
-            
-            self._embedding.weight = nn.Parameter(self._ema_w / self._ema_cluster_size.unsqueeze(1))
-            # TODO: not sure if this is the right way to solve DDP issues:
-            self._embedding.weight.requires_grad=False
-        
-        # Loss
-        e_latent_loss = F.mse_loss(quantized.detach(), inputs)
-        latent_loss = self._commitment_cost * e_latent_loss
-        
-        # Straight Through Estimator
-        quantized = inputs + (quantized - inputs).detach()
-        avg_probs = torch.mean(encodings, dim=0)
-        perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-10)))
-        
-        return quantized, latent_loss, perplexity, encoding_indices
-
-
 class VQVideo(nn.Module):
     def __init__(self, encoder_config, decoder_config, quantizer_config, spatial_embeddings):
         super().__init__()
-        self.width = encoder_config.width
+        self.width = decoder_config.width
         self.n_dynamics_tokens = encoder_config.n_dynamics_tokens
 
         self.register_buffer('spatial_embeddings', spatial_embeddings, persistent=False)
@@ -271,6 +220,11 @@ class VQVideo(nn.Module):
             nn.GELU(),
             nn.Linear(hidden_size, self.width, bias=False),
         )
+        self.diff_proj = nn.Sequential(
+            nn.Linear(quantizer_config.embedding_dim, hidden_size, bias=False),
+            nn.GELU(),
+            nn.Linear(hidden_size, self.width, bias=False),
+        )
 
         self.encoder = Encoder(
             width=encoder_config.width,
@@ -278,6 +232,7 @@ class VQVideo(nn.Module):
             heads=encoder_config.heads,
             n_input_tokens=encoder_config.n_input_tokens,
             n_dynamics_tokens=encoder_config.n_dynamics_tokens,
+            output_dim=encoder_config.output_dim,
         )
         self.decoder = Decoder(
             width=decoder_config.width,
@@ -297,10 +252,12 @@ class VQVideo(nn.Module):
     def encode_diff(self, x):
         x = x.reshape(x.shape[0], x.shape[1], -1) # flatten representation
         embs = self.spatial_embeddings[x]
+        embs = self.frame_proj(embs)
         return self.encoder(embs)
 
     def decode(self, x, f):
         x = self.spatial_embeddings[x]
+        x = self.frame_proj(x)
         logits = self.decoder(x, f)
         # TODO: very weakly matters but changes loss curve so I'll keep this
         # used to just not work for the second one, now it works fine
@@ -311,13 +268,13 @@ class VQVideo(nn.Module):
     def forward(self, x):
         x = x.reshape(x.shape[0], x.shape[1], -1) # flatten representation
         embs = self.spatial_embeddings[x]
-
         embs = self.frame_proj(embs)
 
         f_emb = self.encoder(embs)
 
         f, latent_loss, ppl, encodings = self.quantizer(f_emb)
         latent_info = {'latent_loss': latent_loss, 'perplexity': ppl, 'encodings': encodings}
+        f = self.diff_proj(f)
 
         x0 = x[:, 0].reshape(x.shape[0], -1).long()
         logits = self.decode(x0, f)

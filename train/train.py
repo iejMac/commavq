@@ -11,7 +11,7 @@ from torch import optim
 from dataloader import TokenLoader
 from distributed import is_master, init_distributed_device
 from evaluate import compute_acc_metrics, compute_usage_loss, evaluate_model
-from model import VQVideo, N_FRAME_TOKS
+from model import VQVideo, EncoderConfig, DecoderConfig, QuantizerConfig, N_FRAME_TOKENS
 
 
 class AttrDict(dict):
@@ -43,7 +43,8 @@ if  __name__ == "__main__":
         torch.backends.cudnn.deterministic = False
 
     # Logging
-    enable_wandb = True and is_master(args)
+    enable_wandb = False and is_master(args)
+    log_every_n_steps = 1
     eval_every_n_steps, validation_steps = 5000, 100
     save_checkpoint_n_steps = 5000
 
@@ -53,30 +54,59 @@ if  __name__ == "__main__":
         )
 
     # Data Prep
-    batch_size = 16
+    batch_size = 128
     n_frames = 2
-    n_dynamics_tokens = 64
     train_dataloader = TokenLoader('datasets/commavq-mini.npy', batch_size, n_frames=n_frames)
     # train_dataloader = TokenLoader('datasets/commavq-train.npy', batch_size, n_frames=n_frames)
     val_dataloader = TokenLoader('datasets/commavq-val.npy', batch_size, n_frames=n_frames)
 
     # Model Prep
+    n_dynamics_tokens = 64
+    quantized_width = 256
+    common_width = 256
+
     spatial_embeddings = torch.load("embedding.pt")
     spatial_embeddings.requires_grad = False
 
+    encoder_config = EncoderConfig(
+        width=common_width,
+        layers=8,
+        heads=8,
+        n_input_tokens=2*N_FRAME_TOKENS + 2,
+        n_dynamics_tokens=n_dynamics_tokens,
+    )
+    decoder_config = DecoderConfig(
+        width=common_width,
+        layers=8,
+        heads=8,
+        n_input_tokens=N_FRAME_TOKENS + n_dynamics_tokens + 2,
+        n_dynamics_tokens=n_dynamics_tokens,
+        weight_tying=False,
+    )
+    quantizer_config = QuantizerConfig(
+        n_embeddings=1024,
+        embedding_dim=quantized_width,
+        commitment_cost=0.25,
+    )
+
     model = VQVideo(
-        n_dynamics_toks = n_dynamics_tokens,
-        n_frames = n_frames,
+        encoder_config=encoder_config,
+        decoder_config=decoder_config,
+        quantizer_config=quantizer_config,
         spatial_embeddings = spatial_embeddings,
     ).to(device)
     model.device = device
+
+    if is_master(args):
+        n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"Model has {n_params} parameters")
 
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[device])
 
     # Opt Prep
-    iters = 10000000
-    grad_clip_norm = 3
+    iters = 60000
+    grad_clip_norm = -1
 
     opt = optim.AdamW(
         model.parameters(),
@@ -151,7 +181,7 @@ if  __name__ == "__main__":
         if (save_checkpoint_n_steps != -1) and ((i+1) % save_checkpoint_n_steps == 0):
             torch.save(model.state_dict(), 'latest_vq_video.pth')
 
-        if is_master(args):
+        if ((i+1) % log_every_n_steps == 0) and is_master(args):
             print(f"Step {i}")
             print("--------")
             for name, val in log.items():

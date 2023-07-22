@@ -2,26 +2,33 @@ import torch
 import math
 import numpy as np
 
+from dataclasses import dataclass
 from torch import nn
 from torch.nn import functional as F
 
 from transformer import Transformer
 
 
-N_FRAME_TOKS = 128
+N_FRAME_TOKENS = 128
 
+@dataclass
+class EncoderConfig:
+    width: int = 256
+    layers: int = 8
+    heads: int = 8
+    n_input_tokens: int = 2*N_FRAME_TOKENS + 2
+    n_dynamics_tokens: int = 64
 
 class Encoder(nn.Module):
-    def __init__(self, width, layers, heads, n_tokens, n_input_tokens, spatial_embeddings):
+    def __init__(self, width, layers, heads, n_input_tokens, n_dynamics_tokens):
         super().__init__()
         self.transformer = Transformer(width, layers, heads)
-        self.n_tokens = n_tokens
+        self.n_dynamics_tokens = n_dynamics_tokens
 
         scale = width ** -0.5
         self.frame_delim = nn.Parameter(torch.randn(width) * scale)
 
         self.pos_emb = nn.Embedding(n_input_tokens, width)
-        self.register_buffer('spatial_embeddings', spatial_embeddings, persistent=False)
 
         self.init_parameters()
 
@@ -37,10 +44,7 @@ class Encoder(nn.Module):
             nn.init.normal_(block.mlp.c_fc.weight, std=fc_std)
             nn.init.normal_(block.mlp.c_proj.weight, std=proj_std)
 
-    def forward(self, x):
-        x = x.reshape(x.shape[0], x.shape[1], -1) # flatten representation
-
-        embs = self.spatial_embeddings[x]
+    def forward(self, embs):
         embs = torch.cat((embs,
             self.frame_delim + torch.zeros(embs.shape[0], embs.shape[1], 1, embs.shape[-1], dtype=embs.dtype, device=embs.device)
         ), dim=-2)
@@ -56,17 +60,27 @@ class Encoder(nn.Module):
         c_embs = c_embs.permute(1, 0, 2)  # LND -> NLD
 
         # TODO: very weakly matters but changes loss curve so I'll keep this
-        f = c_embs[:, :self.n_tokens]  # transformation is bottlenecked
-        # f = c_embs[:, -self.n_tokens:]  # transformation is bottlenecked
+        f = c_embs[:, :self.n_dynamics_tokens]  # transformation is bottlenecked
+        # f = c_embs[:, -self.n_dynamics_tokens:]  # transformation is bottlenecked
         return f
 
 
+@dataclass
+class DecoderConfig:
+    width: int = 256
+    layers: int = 8
+    heads: int = 8
+    n_input_tokens: int = N_FRAME_TOKENS + 64 + 2
+    n_dynamics_tokens: int = 64
+    weight_tying: bool = False
+    spatial_embeddings: torch.Tensor = None
+
 class Decoder(nn.Module):
-    def __init__(self, width, layers, heads, n_tokens, n_input_tokens, spatial_embeddings):
+    def __init__(self, width, layers, heads, n_input_tokens, n_dynamics_tokens, weight_tying, spatial_embeddings=None):
         super().__init__()
         self.transformer = Transformer(width, layers, heads)
         self.pred_head = nn.Linear(width, 1024, bias=False)
-        self.weight_tying = True
+        self.weight_tying = weight_tying
         if self.weight_tying:
             self.pred_head.weight = nn.Parameter(spatial_embeddings)
             self.pred_head.requires_grad = False
@@ -75,9 +89,8 @@ class Decoder(nn.Module):
         self.frame_delim = nn.Parameter(torch.randn(width) * scale)
         self.pos_emb = nn.Embedding(n_input_tokens, width)
 
-        full_attn_mask = self.build_attention_mask(2 * N_FRAME_TOKS + n_tokens)
+        # full_attn_mask = self.build_attention_mask(2 * N_FRAME_TOKENS + n_dynamics_tokens)
         # self.register_buffer('attn_mask', full_attn_mask, persistent=False)
-        self.register_buffer('spatial_embeddings', spatial_embeddings, persistent=False)
 
         self.init_parameters()
 
@@ -107,8 +120,6 @@ class Decoder(nn.Module):
         return mask
         
     def forward(self, x, f):
-        x = self.spatial_embeddings[x]
-
         fx = torch.cat([
             x,
             self.frame_delim.to(x.dtype)  + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device),
@@ -129,6 +140,12 @@ class Decoder(nn.Module):
         logits = self.pred_head(y)
         return logits
 
+
+@dataclass
+class QuantizerConfig:
+    n_embeddings: int = 1024
+    embedding_dim: int = 256
+    commitment_cost: float = 0.25
 
 class Quantizer(nn.Module):
     def __init__(self, n_embeddings, embedding_dim, commitment_cost):
@@ -241,54 +258,63 @@ class QuantizerEMA(nn.Module):
 
 
 class VQVideo(nn.Module):
-    def __init__(self, n_dynamics_toks, n_frames, spatial_embeddings):
+    def __init__(self, encoder_config, decoder_config, quantizer_config, spatial_embeddings):
         super().__init__()
-        self.n_dynamics_tokens = n_dynamics_toks
-        self.n_frames = n_frames
+        self.width = encoder_config.width
+        self.n_dynamics_tokens = encoder_config.n_dynamics_tokens
+
+        self.register_buffer('spatial_embeddings', spatial_embeddings, persistent=False)
+
+        hidden_size = (256 + self.width) // 2
+        self.frame_proj = nn.Sequential(
+            nn.Linear(256, hidden_size, bias=False),
+            nn.GELU(),
+            nn.Linear(hidden_size, self.width, bias=False),
+        )
 
         self.encoder = Encoder(
-            width=256,
-            layers=8,
-            heads=8,
-            n_tokens=n_dynamics_toks,
-            n_input_tokens=n_frames*128 + n_frames,
-            spatial_embeddings=spatial_embeddings,
+            width=encoder_config.width,
+            layers=encoder_config.layers,
+            heads=encoder_config.heads,
+            n_input_tokens=encoder_config.n_input_tokens,
+            n_dynamics_tokens=encoder_config.n_dynamics_tokens,
         )
         self.decoder = Decoder(
-            width=256,
-            layers=8,
-            heads=8,
-            n_tokens=n_dynamics_toks,
-            n_input_tokens=n_dynamics_toks + N_FRAME_TOKS + 2,
-            spatial_embeddings=spatial_embeddings,
+            width=decoder_config.width,
+            layers=decoder_config.layers,
+            heads=decoder_config.heads,
+            n_input_tokens=decoder_config.n_input_tokens,
+            n_dynamics_tokens=decoder_config.n_dynamics_tokens,
+            weight_tying=decoder_config.weight_tying,
+            spatial_embeddings = spatial_embeddings,
         )
         self.quantizer = Quantizer(
-            n_embeddings=1024,
-            embedding_dim=256,
-            commitment_cost=0.25,
+            n_embeddings=quantizer_config.n_embeddings,
+            embedding_dim=quantizer_config.embedding_dim,
+            commitment_cost=quantizer_config.commitment_cost,
         )
-        '''
-        self.quantizer = QuantizerEMA(
-            n_embeddings=1024,
-            embedding_dim=256,
-            commitment_cost=0.25,
-            decay=0.99,
-        )
-        '''
 
     def encode_diff(self, x):
-        return self.encoder(x)
+        x = x.reshape(x.shape[0], x.shape[1], -1) # flatten representation
+        embs = self.spatial_embeddings[x]
+        return self.encoder(embs)
 
     def decode(self, x, f):
+        x = self.spatial_embeddings[x]
         logits = self.decoder(x, f)
         # TODO: very weakly matters but changes loss curve so I'll keep this
         # used to just not work for the second one, now it works fine
-        true_logits = logits[:, :N_FRAME_TOKS]  # for now only one frame
-        # true_logits = logits[:, -N_FRAME_TOKS:]
+        true_logits = logits[:, :N_FRAME_TOKENS]  # for now only one frame
+        # true_logits = logits[:, -N_FRAME_TOKENS:]
         return true_logits
 
     def forward(self, x):
-        f_emb = self.encode_diff(x)
+        x = x.reshape(x.shape[0], x.shape[1], -1) # flatten representation
+        embs = self.spatial_embeddings[x]
+
+        embs = self.frame_proj(embs)
+
+        f_emb = self.encoder(embs)
 
         f, latent_loss, ppl, encodings = self.quantizer(f_emb)
         latent_info = {'latent_loss': latent_loss, 'perplexity': ppl, 'encodings': encodings}

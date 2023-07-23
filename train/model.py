@@ -38,7 +38,6 @@ class Encoder(nn.Module):
         self.pos_emb = nn.Embedding(n_input_tokens, width)
         self.output_dim = width if output_dim == -1 else output_dim
 
-
         self.proj = nn.Linear(self.width, self.output_dim, bias=False)
         self.init_parameters()
 
@@ -174,7 +173,32 @@ class Quantizer(nn.Module):
         self.commitment_cost = commitment_cost
 
         self.embedding = nn.Embedding(n_embeddings, embedding_dim)
-        self.embedding.weight.data.uniform_(-1/n_embeddings, 1/self.n_embeddings)
+        self.init_parameters()
+
+    def init_parameters(self):
+        self.embedding.weight.data.uniform_(-1/self.n_embeddings, 1/self.n_embeddings)
+
+    def reinit_unused_codebook(self, encodings):
+        with torch.no_grad():
+            # TODO: Initialize things better so this is ~uniform, currently 80% vectors get 0 probability mass
+            avg_probs = torch.mean(encodings, dim=0)
+
+            # TODO: maybe <= threshold, not just 0.0 (check back after first test runs)
+            used = (avg_probs != 0.0)[:, None]
+
+            mean = (self.embedding.weight * used).sum() / used.sum()
+            std = torch.sqrt((torch.pow(self.embedding.weight - mean, 2) * used).sum() / used.sum())
+
+            # TODO: make work with distributed - allgather encodings and allscatter new vectors
+            reinit = torch.empty(self.embedding.weight.shape).normal_(mean=mean.item(), std=std.item()).to(encodings.device)
+            # There is a cleaner way to do this
+            self.embedding.weight[~used[:, 0]] *= 0.0
+            self.embedding.weight += reinit * (~used)
+
+            # TODO: maybe gradients for those need to be 0'd out for safety?
+
+            print(f"Reinitizliaed {(~used).sum()} unused embeddings")
+
 
     def forward(self, f_emb):
         flat_input = f_emb.reshape(-1, self.embedding_dim)
@@ -199,7 +223,7 @@ class Quantizer(nn.Module):
         avg_probs = torch.mean(encodings, dim=0)
         perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-10)))
         
-        return quantized, latent_loss, perplexity, encoding_indices
+        return quantized, latent_loss, perplexity, encodings
 
 
 class VQVideo(nn.Module):

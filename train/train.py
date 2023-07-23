@@ -43,7 +43,7 @@ if  __name__ == "__main__":
         torch.backends.cudnn.deterministic = False
 
     # Logging
-    enable_wandb = True and is_master(args)
+    enable_wandb = False and is_master(args)
     log_every_n_steps = 1
     soft_eval_every_n_steps = 100
     eval_every_n_steps, validation_steps = 5000, 100
@@ -57,12 +57,12 @@ if  __name__ == "__main__":
     # Data Prep
     batch_size = 128
     n_frames = 2
-    # train_dataloader = TokenLoader('datasets/commavq-mini.npy', batch_size, n_frames=n_frames)
-    train_dataloader = TokenLoader('datasets/commavq-train.npy', batch_size, n_frames=n_frames)
+    train_dataloader = TokenLoader('datasets/commavq-mini.npy', batch_size, n_frames=n_frames)
+    # train_dataloader = TokenLoader('datasets/commavq-train.npy', batch_size, n_frames=n_frames)
     val_dataloader = TokenLoader('datasets/commavq-val.npy', batch_size, n_frames=n_frames)
 
     # Model Prep
-    common_width = 576
+    common_width = 256
 
     n_dynamics_tokens = 64
     quantized_width = 256
@@ -72,16 +72,16 @@ if  __name__ == "__main__":
 
     encoder_config = EncoderConfig(
         width=common_width,
-        layers=24,
-        heads=12,
+        layers=8,
+        heads=8,
         n_input_tokens=2*N_FRAME_TOKENS + 2,
         n_dynamics_tokens=n_dynamics_tokens,
         output_dim=quantized_width,
     )
     decoder_config = DecoderConfig(
         width=common_width,
-        layers=24,
-        heads=12,
+        layers=8,
+        heads=8,
         n_input_tokens=N_FRAME_TOKENS + n_dynamics_tokens + 2,
         n_dynamics_tokens=n_dynamics_tokens,
         weight_tying=False,
@@ -154,6 +154,9 @@ if  __name__ == "__main__":
         )
 
         opt.step()
+
+        if (i+1) % 100 == 0:
+            model.quantizer.reinit_unused_codebook(latent_info['encodings'])
 
         batch_time = time.time() - t0
 

@@ -1,11 +1,13 @@
 import torch
 import math
 import numpy as np
+import torch.distributed as dist
 
 from dataclasses import dataclass
 from torch import nn
 from torch.nn import functional as F
 
+from distributed import is_master
 from transformer import Transformer
 
 
@@ -38,21 +40,25 @@ class Encoder(nn.Module):
         self.pos_emb = nn.Embedding(n_input_tokens, width)
         self.output_dim = width if output_dim == -1 else output_dim
 
-
+        self.ln_final = nn.LayerNorm(width)
         self.proj = nn.Linear(self.width, self.output_dim, bias=False)
         self.init_parameters()
 
     def init_parameters(self):
-        nn.init.normal_(self.pos_emb.weight, std=0.01)
+        nn.init.normal_(self.pos_emb.weight, std=0.02)
 
         proj_std = (self.transformer.width ** -0.5) * ((2 * self.transformer.layers) ** -0.5)
         attn_std = self.transformer.width ** -0.5
         fc_std = (2 * self.transformer.width) ** -0.5
+
         for block in self.transformer.resblocks:
             nn.init.normal_(block.attn.in_proj_weight, std=attn_std)
             nn.init.normal_(block.attn.out_proj.weight, std=proj_std)
             nn.init.normal_(block.mlp.c_fc.weight, std=fc_std)
             nn.init.normal_(block.mlp.c_proj.weight, std=proj_std)
+
+        nn.init.normal_(self.proj.weight, mean=0.0, std=proj_std)
+
 
     def forward(self, embs):
         embs = torch.cat((embs,
@@ -69,7 +75,8 @@ class Encoder(nn.Module):
         c_embs = self.transformer(t_embs)
         c_embs = c_embs.permute(1, 0, 2)  # LND -> NLD
 
-        c_embs = self.proj(c_embs)
+        c_embs = self.ln_final(c_embs)
+        c_embs=  self.proj(c_embs)
 
         # TODO: very weakly matters but changes loss curve so I'll keep this
         f = c_embs[:, :self.n_dynamics_tokens]  # transformation is bottlenecked
@@ -114,6 +121,7 @@ class Decoder(nn.Module):
         self.init_parameters()
 
     def init_parameters(self):
+        # TODO: try init here like karpathy (this is decoder)
         nn.init.normal_(self.pos_emb.weight, std=0.01)
 
         proj_std = (self.transformer.width ** -0.5) * ((2 * self.transformer.layers) ** -0.5)
@@ -125,7 +133,8 @@ class Decoder(nn.Module):
             nn.init.normal_(block.mlp.c_fc.weight, std=fc_std)
             nn.init.normal_(block.mlp.c_proj.weight, std=proj_std)
 
-        torch.nn.init.normal_(self.pred_head.weight, mean=0.0, std=0.02/math.sqrt(2*self.transformer.layers))
+        # torch.nn.init.normal_(self.pred_head.weight, mean=0.0, std=0.02/math.sqrt(2*self.transformer.layers))
+        torch.nn.init.normal_(self.pred_head.weight, mean=0.0, std=proj_std)
 
     def build_attention_mask(self, ctx_len):
         # lazily create causal attention mask, with full attention between the tokens
@@ -174,10 +183,40 @@ class Quantizer(nn.Module):
         self.commitment_cost = commitment_cost
 
         self.embedding = nn.Embedding(n_embeddings, embedding_dim)
-        self.embedding.weight.data.uniform_(-1/n_embeddings, 1/self.n_embeddings)
+        self.init_parameters()
+
+    def init_parameters(self):
+        self.embedding.weight.data.uniform_(-1/self.n_embeddings, 1/self.n_embeddings)
+
+    def reinit_unused_codebook(self, encodings, dist_args=None):
+        reinit = torch.empty_like(self.embedding.weight, device=dist_args.device) 
+        used = torch.empty(self.n_embeddings, dtype=torch.bool, device=dist_args.device)
+
+        with torch.no_grad():
+            if not dist_args.distributed or is_master(dist_args):
+                avg_probs = torch.mean(encodings, dim=0)
+
+                # TODO: maybe <= threshold, not just 0.0 (check back after first test runs)
+                used = (avg_probs != 0.0)
+                if used.sum() == self.n_embeddings:
+                    return
+
+                mean = self.embedding.weight[used].mean(dim=0)
+                std = self.embedding.weight[used].std(dim=0)
+                reinit = torch.stack([torch.normal(mean, std) for _ in range(self.n_embeddings)])
+                print(f"Reinitialized {(~used).sum()} unused embeddings")
+
+            if dist_args.distributed:
+                dist.broadcast(reinit, src=0)
+                dist.broadcast(used, src=0)
+               
+            self.embedding.weight[~used] = reinit[~used]
+            # TODO: maybe gradients for those need to be 0'd out for safety?
+            # TODO: optimizer states?
 
     def forward(self, f_emb):
         flat_input = f_emb.reshape(-1, self.embedding_dim)
+
         # Calculate distances
         distances = (torch.sum(flat_input**2, dim=1, keepdim=True) 
                     + torch.sum(self.embedding.weight**2, dim=1)
@@ -187,7 +226,7 @@ class Quantizer(nn.Module):
         encoding_indices = torch.argmin(distances, dim=1).unsqueeze(1)
         encodings = torch.zeros(encoding_indices.shape[0], self.n_embeddings, device=f_emb.device)
         encodings.scatter_(1, encoding_indices, 1)
-        
+
         # Quantize and unflatten
         quantized = torch.matmul(encodings, self.embedding.weight).reshape(f_emb.shape)
 
@@ -199,7 +238,7 @@ class Quantizer(nn.Module):
         avg_probs = torch.mean(encodings, dim=0)
         perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-10)))
         
-        return quantized, latent_loss, perplexity, encoding_indices
+        return quantized, latent_loss, perplexity, encodings
 
 
 class VQVideo(nn.Module):

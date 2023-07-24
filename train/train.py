@@ -43,10 +43,10 @@ if  __name__ == "__main__":
         torch.backends.cudnn.deterministic = False
 
     # Logging
-    enable_wandb = True and is_master(args)
-    log_every_n_steps = 1
+    enable_wandb = False and is_master(args)
+    log_every_n_steps = 10
     soft_eval_every_n_steps = 100
-    eval_every_n_steps, validation_steps = 5000, 100
+    eval_every_n_steps, validation_steps = -1, 100
     save_checkpoint_n_steps = -1
 
     if enable_wandb:
@@ -55,33 +55,35 @@ if  __name__ == "__main__":
         )
 
     # Data Prep
-    batch_size = 128
+    batch_size = 32
     n_frames = 2
-    # train_dataloader = TokenLoader('datasets/commavq-mini.npy', batch_size, n_frames=n_frames)
-    train_dataloader = TokenLoader('datasets/commavq-train.npy', batch_size, n_frames=n_frames)
+    train_dataloader = TokenLoader('datasets/commavq-mini.npy', batch_size, n_frames=n_frames)
+    # train_dataloader = TokenLoader('datasets/commavq-train.npy', batch_size, n_frames=n_frames)
     val_dataloader = TokenLoader('datasets/commavq-val.npy', batch_size, n_frames=n_frames)
 
     # Model Prep
-    common_width = 576
+    common_width = 256
 
     n_dynamics_tokens = 64
     quantized_width = 256
 
     spatial_embeddings = torch.load("embedding.pt")
+    # spatial_embeddings = torch.empty(spatial_embeddings.shape).uniform_(-1/1024, 1/1024)
+    # spatial_embeddings = torch.empty(spatial_embeddings.shape).normal_(0, 0.02)
     spatial_embeddings.requires_grad = False
 
     encoder_config = EncoderConfig(
         width=common_width,
-        layers=24,
-        heads=12,
+        layers=8,
+        heads=8,
         n_input_tokens=2*N_FRAME_TOKENS + 2,
         n_dynamics_tokens=n_dynamics_tokens,
         output_dim=quantized_width,
     )
     decoder_config = DecoderConfig(
         width=common_width,
-        layers=24,
-        heads=12,
+        layers=8,
+        heads=8,
         n_input_tokens=N_FRAME_TOKENS + n_dynamics_tokens + 2,
         n_dynamics_tokens=n_dynamics_tokens,
         weight_tying=False,
@@ -110,6 +112,7 @@ if  __name__ == "__main__":
     # Opt Prep
     iters = 100000
     grad_clip_norm = -1
+    reinit_unused_codebook_steps = -1
 
     opt = optim.AdamW(
         model.parameters(),
@@ -120,6 +123,7 @@ if  __name__ == "__main__":
 
     i = 0
     t0 = time.time()
+
     for X in train_dataloader:
         if i >= iters:
             break
@@ -154,6 +158,10 @@ if  __name__ == "__main__":
         )
 
         opt.step()
+
+        if (reinit_unused_codebook_steps != -1) and ((i+1) % reinit_unused_codebook_steps == 0):
+            mod = model.module if args.distributed else model
+            mod.quantizer.reinit_unused_codebook(latent_info['encodings'], args)
 
         batch_time = time.time() - t0
 

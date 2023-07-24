@@ -197,13 +197,14 @@ class Quantizer(nn.Module):
                 avg_probs = torch.mean(encodings, dim=0)
 
                 # TODO: maybe <= threshold, not just 0.0 (check back after first test runs)
-                used = (avg_probs != 0.0)
+                used = (avg_probs > 0.0)
                 if used.sum() == self.n_embeddings:
                     return
 
-                mean = self.embedding.weight[used].mean(dim=0)
-                std = self.embedding.weight[used].std(dim=0)
-                reinit = torch.stack([torch.normal(mean, std) for _ in range(self.n_embeddings)])
+                used_vecs = self.embedding.weight[used]
+                samples = torch.randint(high=used.sum(), size=(reinit.shape[0],)).to(reinit.device)
+                reinit = used_vecs[samples]
+                reinit += torch.normal(mean=0.0, std=reinit.std()/100.0, size=reinit.shape).to(reinit.device)
                 print(f"Reinitialized {(~used).sum()} unused embeddings")
 
             if dist_args.distributed:

@@ -43,7 +43,7 @@ if  __name__ == "__main__":
         torch.backends.cudnn.deterministic = False
 
     # Logging
-    enable_wandb = False and is_master(args)
+    enable_wandb = True and is_master(args)
     log_every_n_steps = 10
     soft_eval_every_n_steps = 100
     eval_every_n_steps, validation_steps = -1, 100
@@ -112,7 +112,7 @@ if  __name__ == "__main__":
     # Opt Prep
     iters = 100000
     grad_clip_norm = -1
-    reinit_unused_codebook_steps = -1
+    reinit_unused_codebook_steps = 100
 
     opt = optim.AdamW(
         model.parameters(),

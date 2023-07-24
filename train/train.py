@@ -46,7 +46,7 @@ if  __name__ == "__main__":
     enable_wandb = True and is_master(args)
     log_every_n_steps = 10
     soft_eval_every_n_steps = 100
-    eval_every_n_steps, validation_steps = -1, 100
+    eval_every_n_steps, validation_steps = 100, 100
     save_checkpoint_n_steps = -1
 
     if enable_wandb:
@@ -64,12 +64,10 @@ if  __name__ == "__main__":
     # Model Prep
     common_width = 256
 
-    n_dynamics_tokens = 64
+    n_dynamics_tokens = 32
     quantized_width = 256
 
     spatial_embeddings = torch.load("embedding.pt")
-    # spatial_embeddings = torch.empty(spatial_embeddings.shape).uniform_(-1/1024, 1/1024)
-    # spatial_embeddings = torch.empty(spatial_embeddings.shape).normal_(0, 0.02)
     spatial_embeddings.requires_grad = False
 
     encoder_config = EncoderConfig(
@@ -82,14 +80,14 @@ if  __name__ == "__main__":
     )
     decoder_config = DecoderConfig(
         width=common_width,
-        layers=8,
-        heads=8,
+        layers=4,
+        heads=4,
         n_input_tokens=N_FRAME_TOKENS + n_dynamics_tokens + 2,
         n_dynamics_tokens=n_dynamics_tokens,
         weight_tying=False,
     )
     quantizer_config = QuantizerConfig(
-        n_embeddings=1024,
+        n_embeddings=128,
         embedding_dim=quantized_width,
         commitment_cost=0.25,
     )
@@ -112,7 +110,7 @@ if  __name__ == "__main__":
     # Opt Prep
     iters = 100000
     grad_clip_norm = -1
-    reinit_unused_codebook_steps = 100
+    reinit_unused_codebook_steps = -1
 
     opt = optim.AdamW(
         model.parameters(),
@@ -123,6 +121,7 @@ if  __name__ == "__main__":
 
     i = 0
     t0 = time.time()
+    model.train()
 
     for X in train_dataloader:
         if i >= iters:
@@ -181,13 +180,17 @@ if  __name__ == "__main__":
         log.update(acc_logs)
         # Check if you're using f embedding
         if ((i+1) % soft_eval_every_n_steps == 0) and is_master(args):
+            model.eval()
             mod = model.module if args.distributed else model
             usage_log = compute_usage_loss(mod, X)
             log.update(usage_log)
+            model.train()
         if (eval_every_n_steps != -1) and ((i+1) % eval_every_n_steps == 0):
+            model.eval()
             mod = model.module if args.distributed else model
             val_log = evaluate_model(mod, val_dataloader, validation_steps)
             log.update(val_log)
+            model.train()
 
         # Checkpointing
         if (save_checkpoint_n_steps != -1) and ((i+1) % save_checkpoint_n_steps == 0):

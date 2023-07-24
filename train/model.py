@@ -176,17 +176,24 @@ class QuantizerConfig:
     commitment_cost: float = 0.25
 
 class Quantizer(nn.Module):
+    # TODO: add discarding threshold for reinit
+    # TODO: diff codebook distribution (normal may work)
+    # TODO: maybe try weighting
     def __init__(self, n_embeddings, embedding_dim, commitment_cost):
         super().__init__()
         self.embedding_dim = embedding_dim
         self.n_embeddings = n_embeddings
         self.commitment_cost = commitment_cost
+        self.eps = 1e-12
 
-        self.embedding = nn.Embedding(n_embeddings, embedding_dim)
+        codebook = torch.empty(n_embeddings, embedding_dim)
+        self.codebook = nn.Parameter(codebook, requires_grad=True)
+        # self.embedding = nn.Embedding(n_embeddings, embedding_dim)
         self.init_parameters()
 
     def init_parameters(self):
-        self.embedding.weight.data.uniform_(-1/self.n_embeddings, 1/self.n_embeddings)
+        self.codebook.data.uniform_(-1/self.n_embeddings, 1/self.n_embeddings)
+        # self.embedding.weight.data.uniform_(-1/self.n_embeddings, 1/self.n_embeddings)
 
     def reinit_unused_codebook(self, encodings, dist_args=None):
         reinit = torch.empty_like(self.embedding.weight, device=dist_args.device) 
@@ -194,6 +201,8 @@ class Quantizer(nn.Module):
 
         with torch.no_grad():
             if not dist_args.distributed or is_master(dist_args):
+                # TODO: track usage during 100 bathces of inference, not just one batch
+                # then allgather, then reinit
                 avg_probs = torch.mean(encodings, dim=0)
 
                 # TODO: maybe <= threshold, not just 0.0 (check back after first test runs)
@@ -218,6 +227,7 @@ class Quantizer(nn.Module):
     def forward(self, f_emb):
         flat_input = f_emb.reshape(-1, self.embedding_dim)
 
+        '''
         # Calculate distances
         distances = (torch.sum(flat_input**2, dim=1, keepdim=True) 
                     + torch.sum(self.embedding.weight**2, dim=1)
@@ -238,7 +248,50 @@ class Quantizer(nn.Module):
         quantized = f_emb + (quantized - f_emb).detach()
         avg_probs = torch.mean(encodings, dim=0)
         perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-10)))
-        
+        '''
+
+        distances = (torch.sum(flat_input ** 2, dim=1, keepdim=True)
+                     - 2 * (torch.matmul(flat_input, self.codebook.t()))
+                     + torch.sum(self.codebook.t() ** 2, dim=0, keepdim=True))
+
+        min_indices = torch.argmin(distances, dim=1)
+
+        if self.training:
+            hard_quantized_input = self.codebook[min_indices]
+            random_vector = torch.randn(flat_input.shape).to(flat_input.device)
+
+            norm_quantization_residual = (flat_input - hard_quantized_input).square().sum(dim=1, keepdim=True).sqrt()
+            norm_random_vector = random_vector.square().sum(dim=1, keepdim=True).sqrt()
+
+            # defining vector quantization error
+            vq_error = (norm_quantization_residual / norm_random_vector + self.eps) * random_vector
+
+            quantized_input = flat_input + vq_error
+
+        else:
+            quantized_input = self.codebook[min_indices]
+
+        # claculating the perplexity (average usage of codebook entries)
+        encodings = torch.zeros(flat_input.shape[0], self.n_embeddings, device=flat_input.device)
+        encodings.scatter_(1, min_indices.reshape([-1, 1]), 1)
+        avg_probs = torch.mean(encodings, dim=0)
+        perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + self.eps)))
+
+        # TODO: this
+        # with torch.no_grad():
+        #     self.codebooks_used[min_indices] += 1
+
+        # TODO: for inference just use codebook
+        # use the first returned tensor "quantized_input" for training phase (Notice that you do not have to use the
+        # tensor "quantized_input" for inference (evaluation) phase)
+        # Also notice you do not need to add a new loss term (for VQ) to your global loss function to optimize codebooks.
+        # Just return the tensor of "quantized_input" as vector quantized version of the input data.
+        # return quantized_input, perplexity
+
+        # TODO: cleanup
+        latent_loss = torch.tensor(0.0).to(quantized_input.device)
+        quantized = quantized_input.reshape(f_emb.shape)
+
         return quantized, latent_loss, perplexity, encodings
 
 

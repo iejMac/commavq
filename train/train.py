@@ -44,9 +44,9 @@ if  __name__ == "__main__":
 
     # Logging
     enable_wandb = True and is_master(args)
-    log_every_n_steps = 10
+    log_every_n_steps = 1
     soft_eval_every_n_steps = 100
-    eval_every_n_steps, validation_steps = -1, 100
+    eval_every_n_steps, validation_steps = 5000, 100
     save_checkpoint_n_steps = -1
 
     if enable_wandb:
@@ -55,10 +55,10 @@ if  __name__ == "__main__":
         )
 
     # Data Prep
-    batch_size = 32
+    batch_size = 128
     n_frames = 2
-    train_dataloader = TokenLoader('datasets/commavq-mini.npy', batch_size, n_frames=n_frames)
-    # train_dataloader = TokenLoader('datasets/commavq-train.npy', batch_size, n_frames=n_frames)
+    # train_dataloader = TokenLoader('datasets/commavq-mini.npy', batch_size, n_frames=n_frames)
+    train_dataloader = TokenLoader('datasets/commavq-train.npy', batch_size, n_frames=n_frames)
     val_dataloader = TokenLoader('datasets/commavq-val.npy', batch_size, n_frames=n_frames)
 
     # Model Prep
@@ -68,8 +68,6 @@ if  __name__ == "__main__":
     quantized_width = 256
 
     spatial_embeddings = torch.load("embedding.pt")
-    # spatial_embeddings = torch.empty(spatial_embeddings.shape).uniform_(-1/1024, 1/1024)
-    # spatial_embeddings = torch.empty(spatial_embeddings.shape).normal_(0, 0.02)
     spatial_embeddings.requires_grad = False
 
     encoder_config = EncoderConfig(
@@ -112,7 +110,7 @@ if  __name__ == "__main__":
     # Opt Prep
     iters = 100000
     grad_clip_norm = -1
-    reinit_unused_codebook_steps = 100
+    reinit_unused_codebook_steps = 1000
 
     opt = optim.AdamW(
         model.parameters(),

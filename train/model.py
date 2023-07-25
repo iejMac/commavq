@@ -40,12 +40,12 @@ class Encoder(nn.Module):
         self.pos_emb = nn.Embedding(n_input_tokens, width)
         self.output_dim = width if output_dim == -1 else output_dim
 
-        self.ln_final = nn.LayerNorm(width)
+        # self.ln_final = nn.LayerNorm(width)
         self.proj = nn.Linear(self.width, self.output_dim, bias=False)
         self.init_parameters()
 
     def init_parameters(self):
-        nn.init.normal_(self.pos_emb.weight, std=0.02)
+        nn.init.normal_(self.pos_emb.weight, std=0.01)
 
         proj_std = (self.transformer.width ** -0.5) * ((2 * self.transformer.layers) ** -0.5)
         attn_std = self.transformer.width ** -0.5
@@ -57,7 +57,7 @@ class Encoder(nn.Module):
             nn.init.normal_(block.mlp.c_fc.weight, std=fc_std)
             nn.init.normal_(block.mlp.c_proj.weight, std=proj_std)
 
-        nn.init.normal_(self.proj.weight, mean=0.0, std=proj_std)
+        # nn.init.normal_(self.proj.weight, mean=0.0, std=proj_std)
 
 
     def forward(self, embs):
@@ -75,7 +75,7 @@ class Encoder(nn.Module):
         c_embs = self.transformer(t_embs)
         c_embs = c_embs.permute(1, 0, 2)  # LND -> NLD
 
-        c_embs = self.ln_final(c_embs)
+        # c_embs = self.ln_final(c_embs)
         c_embs=  self.proj(c_embs)
 
         # TODO: very weakly matters but changes loss curve so I'll keep this
@@ -133,8 +133,8 @@ class Decoder(nn.Module):
             nn.init.normal_(block.mlp.c_fc.weight, std=fc_std)
             nn.init.normal_(block.mlp.c_proj.weight, std=proj_std)
 
-        # torch.nn.init.normal_(self.pred_head.weight, mean=0.0, std=0.02/math.sqrt(2*self.transformer.layers))
-        torch.nn.init.normal_(self.pred_head.weight, mean=0.0, std=proj_std)
+        torch.nn.init.normal_(self.pred_head.weight, mean=0.0, std=0.02/math.sqrt(2*self.transformer.layers))
+        # torch.nn.init.normal_(self.pred_head.weight, mean=0.0, std=proj_std)
 
     def build_attention_mask(self, ctx_len):
         # lazily create causal attention mask, with full attention between the tokens
@@ -166,6 +166,7 @@ class Decoder(nn.Module):
         y = y.permute(1, 0, 2)  # LND -> NLD
 
         logits = self.pred_head(y)
+        
         return logits
 
 
@@ -183,12 +184,14 @@ class Quantizer(nn.Module):
         self.commitment_cost = commitment_cost
 
         self.embedding = nn.Embedding(n_embeddings, embedding_dim)
-        self.init_parameters()
+        self.embedding.weight.data.uniform_(-1/self.n_embeddings, 1/self.n_embeddings)
+        # self.init_parameters()
 
     def init_parameters(self):
         self.embedding.weight.data.uniform_(-1/self.n_embeddings, 1/self.n_embeddings)
 
     def reinit_unused_codebook(self, encodings, dist_args=None):
+        # TODO: naive for now, add variable for tracking usage over many batches and use taht instead of just 1 batch
         reinit = torch.empty_like(self.embedding.weight, device=dist_args.device) 
         used = torch.empty(self.n_embeddings, dtype=torch.bool, device=dist_args.device)
 

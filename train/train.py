@@ -90,6 +90,7 @@ if  __name__ == "__main__":
         n_embeddings=1024,
         embedding_dim=quantized_width,
         commitment_cost=0.25,
+        usage_threshold=0.0, 
     )
 
     model = VQVideo(
@@ -159,7 +160,7 @@ if  __name__ == "__main__":
 
         if (reinit_unused_codebook_steps != -1) and ((i+1) % reinit_unused_codebook_steps == 0):
             mod = model.module if args.distributed else model
-            mod.quantizer.reinit_unused_codebook(latent_info['encodings'], args)
+            mod.quantizer.reinit_unused_codebook(args)
 
         batch_time = time.time() - t0
 

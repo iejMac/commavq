@@ -175,32 +175,40 @@ class QuantizerConfig:
     n_embeddings: int = 1024
     embedding_dim: int = 256
     commitment_cost: float = 0.25
+    usage_threshold: float = 0.0
 
 class Quantizer(nn.Module):
-    def __init__(self, n_embeddings, embedding_dim, commitment_cost):
+    def __init__(self, n_embeddings, embedding_dim, commitment_cost, usage_threshold=0.0):
         super().__init__()
         self.embedding_dim = embedding_dim
         self.n_embeddings = n_embeddings
         self.commitment_cost = commitment_cost
+        self.usage_threshold = usage_threshold
 
         self.embedding = nn.Embedding(n_embeddings, embedding_dim)
-        self.embedding.weight.data.uniform_(-1/self.n_embeddings, 1/self.n_embeddings)
-        # self.init_parameters()
+
+        # Counter variable which contains the number of times each codebook is used
+        self.register_buffer('codebook_used', torch.zeros(self.n_embeddings), persistent=False)
+
+        self.init_parameters()
 
     def init_parameters(self):
         self.embedding.weight.data.uniform_(-1/self.n_embeddings, 1/self.n_embeddings)
 
-    def reinit_unused_codebook(self, encodings, dist_args=None):
-        # TODO: naive for now, add variable for tracking usage over many batches and use taht instead of just 1 batch
+    def reinit_unused_codebook(self, dist_args=None):
+        # TODO: cleanup dist code
         reinit = torch.empty_like(self.embedding.weight, device=dist_args.device) 
         used = torch.empty(self.n_embeddings, dtype=torch.bool, device=dist_args.device)
 
+        if dist_args.distributed:
+            dist.reduce(self.codebook_used, dst=0)
+
         with torch.no_grad():
             if not dist_args.distributed or is_master(dist_args):
-                avg_probs = torch.mean(encodings, dim=0)
+                avg_probs = self.codebook_used / self.codebook_used.sum()
 
                 # TODO: maybe <= threshold, not just 0.0 (check back after first test runs)
-                used = (avg_probs > 0.0)
+                used = (avg_probs > self.usage_threshold)
                 if used.sum() == self.n_embeddings:
                     return
 
@@ -213,10 +221,12 @@ class Quantizer(nn.Module):
             if dist_args.distributed:
                 dist.broadcast(reinit, src=0)
                 dist.broadcast(used, src=0)
-               
+
             self.embedding.weight[~used] = reinit[~used]
             # TODO: maybe gradients for those need to be 0'd out for safety?
             # TODO: optimizer states?
+        # Reset counter
+        self.codebook_used *= 0.0
 
     def forward(self, f_emb):
         flat_input = f_emb.reshape(-1, self.embedding_dim)
@@ -230,6 +240,10 @@ class Quantizer(nn.Module):
         encoding_indices = torch.argmin(distances, dim=1).unsqueeze(1)
         encodings = torch.zeros(encoding_indices.shape[0], self.n_embeddings, device=f_emb.device)
         encodings.scatter_(1, encoding_indices, 1)
+        
+        with torch.no_grad():
+            used = torch.bincount(encoding_indices.flatten(), minlength=self.n_embeddings)
+            self.codebook_used += used
 
         # Quantize and unflatten
         quantized = torch.matmul(encodings, self.embedding.weight).reshape(f_emb.shape)

@@ -201,7 +201,7 @@ class Quantizer(nn.Module):
         used = torch.empty(self.n_embeddings, dtype=torch.bool, device=dist_args.device)
 
         if dist_args.distributed:
-            dist.reduce(self.codebook_used, 0)
+            dist.reduce(self.codebook_used, dst=0)
 
         with torch.no_grad():
             if not dist_args.distributed or is_master(dist_args):

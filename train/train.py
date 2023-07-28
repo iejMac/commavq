@@ -47,7 +47,8 @@ if  __name__ == "__main__":
     log_every_n_steps = 1
     soft_eval_every_n_steps = 100
     eval_every_n_steps, validation_steps = 5000, 100
-    save_checkpoint_n_steps = -1
+    save_checkpoint_n_steps = 1000
+    checkpoint_name = 'latest_vq14M_video.pth'
 
     if enable_wandb:
         wandb.init(
@@ -109,7 +110,7 @@ if  __name__ == "__main__":
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[device])
 
     # Opt Prep
-    iters = 100000
+    iters = 1000000
     grad_clip_norm = -1
     reinit_unused_codebook_steps = 1000
 
@@ -190,7 +191,7 @@ if  __name__ == "__main__":
 
         # Checkpointing
         if (save_checkpoint_n_steps != -1) and ((i+1) % save_checkpoint_n_steps == 0):
-            torch.save(model.state_dict(), 'latest_vq_video.pth')
+            torch.save(model.state_dict(), checkpoint_name)
 
         if ((i+1) % log_every_n_steps == 0) and is_master(args):
             print(f"Step {i}")

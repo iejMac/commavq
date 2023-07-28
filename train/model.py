@@ -207,9 +207,8 @@ class Quantizer(nn.Module):
             if not dist_args.distributed or is_master(dist_args):
                 avg_probs = self.codebook_used / self.codebook_used.sum()
 
-                # TODO: maybe <= threshold, not just 0.0 (check back after first test runs)
                 used = (avg_probs > self.usage_threshold)
-                if used.sum() == self.n_embeddings:
+                if (used.sum() == self.n_embeddings) or (used.sum() == 0.0):
                     return
 
                 used_vecs = self.embedding.weight[used]

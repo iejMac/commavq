@@ -32,10 +32,11 @@ def main(args):
     device = init_distributed_device(args)
 
     if args.name is None:
+        model_name = args.model.split("/")[-1].split(".")[0]
         date_str = datetime.now().strftime("%Y_%m_%d-%H_%M_%S")
         args.name = '-'.join([
             date_str,
-            f"model_{args.model}",
+            f"model_{model_name}",
             f"lr_{args.lr}",
             f"b_{args.batch_size}",
         ])

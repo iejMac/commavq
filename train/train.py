@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 import torch
 import time
 import numpy as np
@@ -67,35 +68,29 @@ def main(args):
     val_dataloader = TokenLoader(args.val_data, args.batch_size, n_frames=args.n_frames)
 
     # Model Prep
-    common_width = 256
+    with open(args.model, "r") as f:
+        model_config = json.load(f)
 
-    n_dynamics_tokens = 64
-    quantized_width = 256
+    quantized_width = model_config['quantizer_cfg']['embedding_dim']
+    n_dynamics_tokens = model_config['n_dynamics_tokens']
 
-    spatial_embeddings = torch.load("embedding.pt")
+    spatial_embeddings = torch.load(model_config['spatial_embedding'])
     spatial_embeddings.requires_grad = False
 
     encoder_config = EncoderConfig(
-        width=common_width,
-        layers=8,
-        heads=8,
         n_input_tokens=args.n_frames*N_FRAME_TOKENS + args.n_frames,
         n_dynamics_tokens=n_dynamics_tokens,
         output_dim=quantized_width,
+        **model_config['encoder_cfg'],
     )
     decoder_config = DecoderConfig(
-        width=common_width,
-        layers=8,
-        heads=8,
         n_input_tokens=N_FRAME_TOKENS + n_dynamics_tokens + 2,
         n_dynamics_tokens=n_dynamics_tokens,
-        weight_tying=False,
+        spatial_embeddings=spatial_embeddings if model_config['decoder_cfg']['weight_tying'] else None,
+        **model_config['decoder_cfg'],
     )
     quantizer_config = QuantizerConfig(
-        n_embeddings=1024,
-        embedding_dim=quantized_width,
-        commitment_cost=0.25,
-        usage_threshold=0.0, 
+        **model_config['quantizer_cfg'],
     )
 
     random_seed(args.seed, 0)

@@ -55,7 +55,6 @@ def main(args):
         os.makedirs(log_base_path, exist_ok=True)
         os.makedirs(args.checkpoint_path, exist_ok=True)
     args.enable_wandb = args.enable_wandb and is_master(args)
-    checkpoint_name = 'latest_vq14M_video.pth'
 
     if args.enable_wandb:
         wandb.init(

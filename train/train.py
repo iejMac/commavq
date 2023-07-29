@@ -193,8 +193,8 @@ def main(args):
         }
 
         # Evals
-        # acc_logs = compute_acc_metrics(true_logits.argmax(dim=-1), X, "train")
-        # log.update(acc_logs)
+        acc_logs = compute_acc_metrics(true_logits.argmax(dim=-1), X, "train")
+        log.update(acc_logs)
         # Check if you're using f embedding and x0 together
         if (args.check_usage_frequency != -1) and (i % args.check_usage_frequency == 0) and is_master(args):
             mod = model.module if args.distributed else model

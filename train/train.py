@@ -1,8 +1,13 @@
+import os
+import sys
+import json
 import torch
 import time
 import numpy as np
 import wandb
+import random
 
+from datetime import datetime
 from datasets import load_dataset
 from torch import nn
 from torch.nn import functional as F
@@ -12,27 +17,29 @@ from dataloader import TokenLoader
 from distributed import is_master, init_distributed_device
 from evaluate import compute_acc_metrics, compute_usage_loss, evaluate_model
 from model import VQVideo, EncoderConfig, DecoderConfig, QuantizerConfig, N_FRAME_TOKENS
+from params import parse_args
 
 
-class AttrDict(dict):
-    """
-    Lets us access dict keys with <dict>.key
-    """
-
-    # pylint: disable=super-with-arguments
-    def __init__(self, *args, **kwargs):
-        super(AttrDict, self).__init__(*args, **kwargs)
-        self.__dict__ = self
+def random_seed(seed=42, rank=0):
+    torch.manual_seed(seed + rank)
+    np.random.seed(seed + rank)
+    random.seed(seed + rank)
 
 
-if  __name__ == "__main__":
-    args = AttrDict(
-        dist_backend="nccl",
-        dist_url="env://",
-        no_set_device_rank=False,
-    )
+def main(args):
+    args = parse_args(args)
 
     device = init_distributed_device(args)
+
+    if args.name is None:
+        model_name = args.model.split("/")[-1].split(".")[0]
+        date_str = datetime.now().strftime("%Y_%m_%d-%H_%M_%S")
+        args.name = '-'.join([
+            date_str,
+            f"model_{model_name}",
+            f"lr_{args.lr}",
+            f"b_{args.batch_size}",
+        ])
 
     if torch.cuda.is_available():
         # This enables tf32 on Ampere GPUs which is only 8% slower than
@@ -43,57 +50,50 @@ if  __name__ == "__main__":
         torch.backends.cudnn.deterministic = False
 
     # Logging
-    enable_wandb = True and is_master(args)
-    log_every_n_steps = 1
-    soft_eval_every_n_steps = 100
-    eval_every_n_steps, validation_steps = 5000, 100
-    save_checkpoint_n_steps = 1000
-    checkpoint_name = 'latest_vq14M_video.pth'
+    log_base_path = os.path.join(args.logs, args.name)
+    args.checkpoint_path = os.path.join(log_base_path, "checkpoints")
+    if is_master(args):
+        os.makedirs(log_base_path, exist_ok=True)
+        os.makedirs(args.checkpoint_path, exist_ok=True)
+    args.enable_wandb = args.enable_wandb and is_master(args)
 
-    if enable_wandb:
+    if args.enable_wandb:
         wandb.init(
             project="diff-encoding",
+            name=args.name,
         )
 
     # Data Prep
-    batch_size = 128
-    n_frames = 2
-    # train_dataloader = TokenLoader('datasets/commavq-mini.npy', batch_size, n_frames=n_frames)
-    train_dataloader = TokenLoader('datasets/commavq-train.npy', batch_size, n_frames=n_frames)
-    val_dataloader = TokenLoader('datasets/commavq-val.npy', batch_size, n_frames=n_frames)
+    train_dataloader = TokenLoader(args.train_data, args.batch_size, n_frames=args.n_frames)
+    val_dataloader = TokenLoader(args.val_data, args.batch_size, n_frames=args.n_frames)
 
     # Model Prep
-    common_width = 256
+    with open(args.model, "r") as f:
+        model_config = json.load(f)
 
-    n_dynamics_tokens = 64
-    quantized_width = 256
+    quantized_width = model_config['quantizer_cfg']['embedding_dim']
+    n_dynamics_tokens = model_config['n_dynamics_tokens']
 
-    spatial_embeddings = torch.load("embedding.pt")
+    spatial_embeddings = torch.load(model_config['spatial_embedding'])
     spatial_embeddings.requires_grad = False
 
     encoder_config = EncoderConfig(
-        width=common_width,
-        layers=8,
-        heads=8,
-        n_input_tokens=2*N_FRAME_TOKENS + 2,
+        n_input_tokens=args.n_frames*N_FRAME_TOKENS + args.n_frames,
         n_dynamics_tokens=n_dynamics_tokens,
         output_dim=quantized_width,
+        **model_config['encoder_cfg'],
     )
     decoder_config = DecoderConfig(
-        width=common_width,
-        layers=8,
-        heads=8,
         n_input_tokens=N_FRAME_TOKENS + n_dynamics_tokens + 2,
         n_dynamics_tokens=n_dynamics_tokens,
-        weight_tying=False,
+        spatial_embeddings=spatial_embeddings if model_config['decoder_cfg']['weight_tying'] else None,
+        **model_config['decoder_cfg'],
     )
     quantizer_config = QuantizerConfig(
-        n_embeddings=1024,
-        embedding_dim=quantized_width,
-        commitment_cost=0.25,
-        usage_threshold=0.0, 
+        **model_config['quantizer_cfg'],
     )
 
+    random_seed(args.seed, 0)
     model = VQVideo(
         encoder_config=encoder_config,
         decoder_config=decoder_config,
@@ -102,30 +102,46 @@ if  __name__ == "__main__":
     ).to(device)
     model.device = device
 
+    random_seed(args.seed, args.rank)
+
     if is_master(args):
         n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print(f"Model has {n_params} parameters")
 
     if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[device])
+        ddp_args = {}
+        if args.ddp_static_graph:
+            ddp_args['static_graph'] = True
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[device], **ddp_args)
 
     # Opt Prep
-    iters = 1000000
-    grad_clip_norm = -1
-    reinit_unused_codebook_steps = 1000
-
     opt = optim.AdamW(
         model.parameters(),
-        lr=3e-4,
-        betas=(0.9, 0.98),  # (0.9, 0.999)
-        eps=1e-6,  # 1e-8
+        lr=args.lr,
+        betas=(args.beta1, args.beta2),
+        eps=args.eps,
+        weight_decay=args.wd,
     )
 
-    i = 0
+    start_step = 1
+    if args.resume is not None:
+        checkpoint = torch.load(args.resume, map_location='cpu')
+        if 'step' in checkpoint:
+            start_step = checkpoint['step']
+            sd = checkpoint['state_dict']
+            if not args.distributed and next(iter(sd.items()))[0].startswith('module'):
+                sd = {k[len('module.'):]: v for k, v in sd.items()}
+            model.load_state_dict(sd)
+            opt.load_state_dict(checkpoint['optimizer'])
+        else:
+            model.load_state_dict(checkpoint)
+        print(f"Resuming checkpoint {args.resume} (step {start_step})")
+
+    i = start_step
     t0 = time.time()
 
     for X in train_dataloader:
-        if i >= iters:
+        if i > args.iters:
             break
         X = X.long().to(device)
         labels = X[:, 1:].reshape(X.shape[0], -1)
@@ -146,8 +162,8 @@ if  __name__ == "__main__":
         loss.backward()
 
         # Clip gradients
-        if grad_clip_norm != -1:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm, norm_type=2.0)
+        if args.grad_clip_norm != -1:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm, norm_type=2.0)
         # Compute gradient norm
         grad_norm = torch.norm(
             torch.stack([
@@ -159,7 +175,7 @@ if  __name__ == "__main__":
 
         opt.step()
 
-        if (reinit_unused_codebook_steps != -1) and ((i+1) % reinit_unused_codebook_steps == 0):
+        if (args.reinit_unused_codebook_frequency != -1) and (i % args.reinit_unused_codebook_frequency == 0):
             mod = model.module if args.distributed else model
             mod.quantizer.reinit_unused_codebook(args)
 
@@ -179,27 +195,38 @@ if  __name__ == "__main__":
         # Evals
         acc_logs = compute_acc_metrics(true_logits.argmax(dim=-1), X, "train")
         log.update(acc_logs)
-        # Check if you're using f embedding
-        if ((i+1) % soft_eval_every_n_steps == 0) and is_master(args):
+        # Check if you're using f embedding and x0 together
+        if (i % args.check_usage_frequency == 0) and is_master(args):
             mod = model.module if args.distributed else model
             usage_log = compute_usage_loss(mod, X)
             log.update(usage_log)
-        if (eval_every_n_steps != -1) and ((i+1) % eval_every_n_steps == 0):
+        if (args.val_frequency != -1) and (i % args.val_frequency == 0):
             mod = model.module if args.distributed else model
-            val_log = evaluate_model(mod, val_dataloader, validation_steps)
+            val_log = evaluate_model(mod, val_dataloader, args.val_steps)
             log.update(val_log)
 
         # Checkpointing
-        if (save_checkpoint_n_steps != -1) and ((i+1) % save_checkpoint_n_steps == 0):
-            torch.save(model.state_dict(), checkpoint_name)
+        if (args.save_frequency != -1) and (i % args.save_frequency == 0):
+            checkpoint_dict = {
+                "step": i,
+                "name": args.name,
+                "state_dict": model.state_dict(),
+                "optimizer": opt.state_dict(),
+            }
 
-        if ((i+1) % log_every_n_steps == 0) and is_master(args):
+            checkpoint_name = os.path.join(args.checkpoint_path, f"step_{'latest' if args.save_most_recent else i}.pth")
+            torch.save(checkpoint_dict, checkpoint_name)
+
+        if (i % args.log_every_n_steps == 0) and is_master(args):
             print(f"Step {i}")
             print("--------")
             for name, val in log.items():
                 print(f"{name}: {val}")
-            if enable_wandb:
+            if args.enable_wandb:
                 wandb.log(log)
 
         i += 1
         t0 = time.time()
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

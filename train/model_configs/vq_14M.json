@@ -1,0 +1,22 @@
+{
+	"common_width": 256,
+	"n_dynamics_tokens": 64,
+	"spatial_embedding": "embedding.pt",
+	"encoder_cfg": {
+		"width": 256,
+		"layers": 8,
+		"heads": 8
+	},
+	"decoder_cfg": {
+		"width": 256,
+		"layers": 8,
+		"heads": 8,
+		"weight_tying": false
+	},
+	"quantizer_cfg": {
+		"n_embeddings": 1024,
+		"embedding_dim": 256,
+		"commitment_cost": 0.25,
+		"usage_threshold": 0.0
+	}
+}

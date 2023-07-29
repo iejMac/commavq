@@ -114,6 +114,7 @@ class Decoder(nn.Module):
         self.pred_head = nn.Linear(width, 1024, bias=False)
         self.weight_tying = weight_tying
         if self.weight_tying:
+            print("Tying prediction head to spatial embedding table...")
             self.pred_head.weight = nn.Parameter(spatial_embeddings)
             self.pred_head.requires_grad = False
 

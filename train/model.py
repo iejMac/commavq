@@ -18,18 +18,18 @@ class EncoderConfig:
     width: int = 256
     layers: int = 8
     heads: int = 8
-    n_input_tokens: int = 2*N_FRAME_TOKENS + 2
     n_dynamics_tokens: int = 64
+    n_frames: int = 2
     output_dim: int = -1
 
 class Encoder(nn.Module):
-    def __init__(self, width, layers, heads, n_input_tokens, n_dynamics_tokens, output_dim):
+    def __init__(self, width, layers, heads, n_dynamics_tokens, n_frames, output_dim):
         super().__init__()
         self.width = width
         self.layers = layers
         self.heads = heads
-        self.n_input_tokens = n_input_tokens
         self.n_dynamics_tokens = n_dynamics_tokens
+        self.n_frames = n_frames
         self.output_dim = output_dim
 
         self.transformer = Transformer(width, layers, heads)
@@ -37,10 +37,13 @@ class Encoder(nn.Module):
         scale = width ** -0.5
         self.frame_delim = nn.Parameter(torch.randn(width) * scale)
 
-        self.pos_emb = nn.Embedding(n_input_tokens, width)
+        self.pos_emb = nn.Embedding(n_frames*N_FRAME_TOKENS + n_frames, width)
         self.output_dim = width if output_dim == -1 else output_dim
 
-        # self.ln_final = nn.LayerNorm(width)
+        start_indices = torch.arange(0, (n_frames - 1) * N_FRAME_TOKENS, N_FRAME_TOKENS)
+        dynamics_inds = torch.cat([start_indices + i for i in range(n_dynamics_tokens)])
+        self.register_buffer('dynamics_inds', dynamics_inds, persistent=False)
+
         self.proj = nn.Linear(self.width, self.output_dim, bias=False)
         self.init_parameters()
 
@@ -61,8 +64,9 @@ class Encoder(nn.Module):
 
 
     def forward(self, embs):
-        embs = torch.cat((embs,
-            self.frame_delim + torch.zeros(embs.shape[0], embs.shape[1], 1, embs.shape[-1], dtype=embs.dtype, device=embs.device)
+        embs = torch.cat((
+            embs,
+            self.frame_delim + torch.zeros(embs.shape[0], embs.shape[1], 1, embs.shape[-1], dtype=embs.dtype, device=embs.device),
         ), dim=-2)
         embs = embs.reshape(embs.shape[0], -1, embs.shape[-1])
 
@@ -76,10 +80,12 @@ class Encoder(nn.Module):
         c_embs = c_embs.permute(1, 0, 2)  # LND -> NLD
 
         # c_embs = self.ln_final(c_embs)
-        c_embs=  self.proj(c_embs)
+        c_embs = self.proj(c_embs)
+
+        f = c_embs.index_select(1, self.dynamics_inds)
 
         # TODO: very weakly matters but changes loss curve so I'll keep this
-        f = c_embs[:, :self.n_dynamics_tokens]  # transformation is bottlenecked
+        # f = c_embs[:, :self.n_dynamics_tokens]  # transformation is bottlenecked
         # f = c_embs[:, -self.n_dynamics_tokens:]  # transformation is bottlenecked
         return f
 
@@ -89,19 +95,19 @@ class DecoderConfig:
     width: int = 256
     layers: int = 8
     heads: int = 8
-    n_input_tokens: int = N_FRAME_TOKENS + 64 + 2
     n_dynamics_tokens: int = 64
+    n_frames: int = 2
     weight_tying: bool = False
     spatial_embeddings: torch.Tensor = None
 
 class Decoder(nn.Module):
-    def __init__(self, width, layers, heads, n_input_tokens, n_dynamics_tokens, weight_tying, spatial_embeddings=None):
+    def __init__(self, width, layers, heads, n_dynamics_tokens, n_frames, weight_tying, spatial_embeddings=None):
         super().__init__()
         self.width = width
         self.layers = layers
         self.heads = heads
-        self.n_input_tokens = n_input_tokens
         self.n_dynamics_tokens = n_dynamics_tokens
+        self.n_frames = n_frames
         self.weight_tying = weight_tying
 
         self.transformer = Transformer(width, layers, heads)
@@ -113,10 +119,12 @@ class Decoder(nn.Module):
 
         scale = width ** -0.5
         self.frame_delim = nn.Parameter(torch.randn(width) * scale)
+        # n_input_tokens = N_FRAME_TOKENS + n_dynamics_tokens * (n_frames - 1) + n_frames
+        n_input_tokens = N_FRAME_TOKENS * n_frames
         self.pos_emb = nn.Embedding(n_input_tokens, width)
 
-        # full_attn_mask = self.build_attention_mask(2 * N_FRAME_TOKENS + n_dynamics_tokens)
-        # self.register_buffer('attn_mask', full_attn_mask, persistent=False)
+        full_attn_mask = self.build_attention_mask(n_input_tokens, N_FRAME_TOKENS)
+        self.register_buffer('attn_mask', full_attn_mask, persistent=False)
 
         self.init_parameters()
 
@@ -136,23 +144,34 @@ class Decoder(nn.Module):
         torch.nn.init.normal_(self.pred_head.weight, mean=0.0, std=0.02/math.sqrt(2*self.transformer.layers))
         # torch.nn.init.normal_(self.pred_head.weight, mean=0.0, std=proj_std)
 
-    def build_attention_mask(self, ctx_len):
+    def build_attention_mask(self, seq_len, block_size):
         # lazily create causal attention mask, with full attention between the tokens
         # pytorch uses additive attention mask; fill with -inf
-
-        # TODO: might need to build attn mask every time for dynamic stuff
-        # TODO: try out blocked attention masks (frame is atomic element)
+        '''
+        # token level
         mask = torch.empty(ctx_len, ctx_len)
         mask.fill_(float("-inf"))
         mask.triu_(1)  # zero out the lower diagonal
+        '''
+
+        # block level
+        mask = torch.full((seq_len, seq_len), float('-inf'))
+        # Block diagonal mask should have ones (i.e., zero out after fill with '-inf')
+        for i in range(0, seq_len, block_size):
+            mask[i:i+block_size, :i+block_size] = 0  # unmask block diagonal
         return mask
         
     def forward(self, x, f):
+        f = f.reshape(f.shape[0], -1, self.n_dynamics_tokens, self.width)
+
+        f = torch.cat((
+            self.frame_delim + torch.zeros(f.shape[0], f.shape[1], N_FRAME_TOKENS-self.n_dynamics_tokens, f.shape[-1], dtype=f.dtype, device=f.device),
+            f,
+        ), dim=-2)
+
         fx = torch.cat([
             x,
-            self.frame_delim.to(x.dtype)  + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device),
-            f,
-            self.frame_delim.to(x.dtype)  + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device),
+            f.reshape(f.shape[0], -1, f.shape[-1]),
         ], dim=1)  # concat space code with transformation code
 
         pos = torch.arange(0, fx.shape[1], dtype=torch.long, device=x.device).unsqueeze(0) 
@@ -161,12 +180,11 @@ class Decoder(nn.Module):
         fx = fx + p_embs
 
         fx = fx.permute(1, 0, 2)  # NLD -> LND
-        # y = self.transformer(fx, attn_mask=self.attn_mask)
-        y = self.transformer(fx)
+        y = self.transformer(fx, attn_mask=self.attn_mask)
+        # y = self.transformer(fx)
         y = y.permute(1, 0, 2)  # LND -> NLD
 
         logits = self.pred_head(y)
-        
         return logits
 
 
@@ -274,16 +292,16 @@ class VQVideo(nn.Module):
             width=encoder_config.width,
             layers=encoder_config.layers,
             heads=encoder_config.heads,
-            n_input_tokens=encoder_config.n_input_tokens,
             n_dynamics_tokens=encoder_config.n_dynamics_tokens,
+            n_frames=encoder_config.n_frames,
             output_dim=encoder_config.output_dim,
         )
         self.decoder = Decoder(
             width=decoder_config.width,
             layers=decoder_config.layers,
             heads=decoder_config.heads,
-            n_input_tokens=decoder_config.n_input_tokens,
             n_dynamics_tokens=decoder_config.n_dynamics_tokens,
+            n_frames=decoder_config.n_frames,
             weight_tying=decoder_config.weight_tying,
             spatial_embeddings = spatial_embeddings,
         )
@@ -303,9 +321,11 @@ class VQVideo(nn.Module):
         x = self.spatial_embeddings[x]
         x = self.frame_proj(x)
         logits = self.decoder(x, f)
+
+        true_logits = logits[:, N_FRAME_TOKENS:]
         # TODO: very weakly matters but changes loss curve so I'll keep this
         # used to just not work for the second one, now it works fine
-        true_logits = logits[:, :N_FRAME_TOKENS]  # for now only one frame
+        # true_logits = logits[:, :N_FRAME_TOKENS]  # for now only one frame
         # true_logits = logits[:, -N_FRAME_TOKENS:]
         return true_logits
 

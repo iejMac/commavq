@@ -78,14 +78,14 @@ def main(args):
     spatial_embeddings.requires_grad = False
 
     encoder_config = EncoderConfig(
-        n_input_tokens=args.n_frames*N_FRAME_TOKENS + args.n_frames,
         n_dynamics_tokens=n_dynamics_tokens,
+        n_frames=args.n_frames,
         output_dim=quantized_width,
         **model_config['encoder_cfg'],
     )
     decoder_config = DecoderConfig(
-        n_input_tokens=N_FRAME_TOKENS + n_dynamics_tokens + 2,
         n_dynamics_tokens=n_dynamics_tokens,
+        n_frames=args.n_frames,
         spatial_embeddings=spatial_embeddings if model_config['decoder_cfg']['weight_tying'] else None,
         **model_config['decoder_cfg'],
     )
@@ -193,10 +193,10 @@ def main(args):
         }
 
         # Evals
-        acc_logs = compute_acc_metrics(true_logits.argmax(dim=-1), X, "train")
-        log.update(acc_logs)
+        # acc_logs = compute_acc_metrics(true_logits.argmax(dim=-1), X, "train")
+        # log.update(acc_logs)
         # Check if you're using f embedding and x0 together
-        if (i % args.check_usage_frequency == 0) and is_master(args):
+        if (args.check_usage_frequency != -1) and (i % args.check_usage_frequency == 0) and is_master(args):
             mod = model.module if args.distributed else model
             usage_log = compute_usage_loss(mod, X)
             log.update(usage_log)

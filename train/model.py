@@ -111,10 +111,13 @@ class Decoder(nn.Module):
         self.weight_tying = weight_tying
 
         self.transformer = Transformer(width, layers, heads)
+        self.final_proj = None
         self.pred_head = nn.Linear(width, 1024, bias=False)
         self.weight_tying = weight_tying
         if self.weight_tying:
             print("Tying prediction head to spatial embedding table...")
+            if self.width != 256:
+                self.final_proj = nn.Linear(self.width, 256, bias=False)
             self.pred_head.weight = nn.Parameter(spatial_embeddings)
             self.pred_head.requires_grad = False
 
@@ -184,6 +187,9 @@ class Decoder(nn.Module):
         y = self.transformer(fx, attn_mask=self.attn_mask)
         # y = self.transformer(fx)
         y = y.permute(1, 0, 2)  # LND -> NLD
+
+        if self.final_proj is not None:
+            y = self.final_proj(y)
 
         logits = self.pred_head(y)
         return logits

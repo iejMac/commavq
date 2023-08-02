@@ -127,12 +127,14 @@ def main(args):
     if args.resume is not None:
         checkpoint = torch.load(args.resume, map_location='cpu')
         if 'step' in checkpoint:
-            start_step = checkpoint['step']
+            start_step = checkpoint['step'] + 1
             sd = checkpoint['state_dict']
             if not args.distributed and next(iter(sd.items()))[0].startswith('module'):
                 sd = {k[len('module.'):]: v for k, v in sd.items()}
+
             model.load_state_dict(sd)
             opt.load_state_dict(checkpoint['optimizer'])
+            # opt.zero_grad()
         else:
             model.load_state_dict(checkpoint)
         print(f"Resuming checkpoint {args.resume} (step {start_step})")
@@ -192,41 +194,44 @@ def main(args):
             "train/grad_norm": grad_norm.item(),
         }
 
-        # Evals
-        ns = [1]
-        if args.n_frames > 2:
-            ns.append(args.n_frames - 1)
-        acc_logs = compute_acc_metrics(true_logits.argmax(dim=-1), X, ns, "train")
-        log.update(acc_logs)
-        # Check if you're using f embedding and x0 together
-        if (args.check_usage_frequency != -1) and (i % args.check_usage_frequency == 0) and is_master(args):
-            mod = model.module if args.distributed else model
-            usage_log = compute_usage_loss(mod, X)
-            log.update(usage_log)
-        if (args.val_frequency != -1) and (i % args.val_frequency == 0):
-            mod = model.module if args.distributed else model
-            val_log = evaluate_model(mod, val_dataloader, args.val_steps)
-            log.update(val_log)
+        # Evals + Logging
+        if is_master(args):
+            model.eval()
+            ns = [1]
+            if args.n_frames > 2:
+                ns.append(args.n_frames - 1)
+            acc_logs = compute_acc_metrics(true_logits.argmax(dim=-1), X, ns, "train")
+            log.update(acc_logs)
+            # Check if you're using f embedding and x0 together
+            if (args.check_usage_frequency != -1) and (i % args.check_usage_frequency == 0):
+                mod = model.module if args.distributed else model
+                usage_log = compute_usage_loss(mod, X)
+                log.update(usage_log)
+            if (args.val_frequency != -1) and (i % args.val_frequency == 0):
+                mod = model.module if args.distributed else model
+                val_log = evaluate_model(mod, val_dataloader, args.val_steps)
+                log.update(val_log)
+            model.train()
 
-        # Checkpointing
-        if (args.save_frequency != -1) and (i % args.save_frequency == 0):
-            checkpoint_dict = {
-                "step": i,
-                "name": args.name,
-                "state_dict": model.state_dict(),
-                "optimizer": opt.state_dict(),
-            }
+            # Checkpointing
+            if (args.save_frequency != -1) and (i % args.save_frequency == 0):
+                checkpoint_dict = {
+                    "step": i,
+                    "name": args.name,
+                    "state_dict": model.state_dict(),
+                    "optimizer": opt.state_dict(),
+                }
 
-            checkpoint_name = os.path.join(args.checkpoint_path, f"step_{'latest' if args.save_most_recent else i}.pth")
-            torch.save(checkpoint_dict, checkpoint_name)
+                checkpoint_name = os.path.join(args.checkpoint_path, f"step_{'latest' if args.save_most_recent else i}.pth")
+                torch.save(checkpoint_dict, checkpoint_name)
 
-        if (i % args.log_every_n_steps == 0) and is_master(args):
-            print(f"Step {i}")
-            print("--------")
-            for name, val in log.items():
-                print(f"{name}: {val}")
-            if args.enable_wandb:
-                wandb.log(log)
+            if (i % args.log_every_n_steps == 0):
+                print(f"Step {i}")
+                print("--------")
+                for name, val in log.items():
+                    print(f"{name}: {val}")
+                if args.enable_wandb:
+                    wandb.log(log)
 
         i += 1
         t0 = time.time()

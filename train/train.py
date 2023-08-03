@@ -134,7 +134,6 @@ def main(args):
 
             model.load_state_dict(sd)
             opt.load_state_dict(checkpoint['optimizer'])
-            # opt.zero_grad()
         else:
             model.load_state_dict(checkpoint)
         print(f"Resuming checkpoint {args.resume} (step {start_step})")

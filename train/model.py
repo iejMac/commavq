@@ -185,6 +185,8 @@ class Quantizer(nn.Module):
         self.commitment_cost = commitment_cost
         self.usage_threshold = usage_threshold
 
+        self.norm = lambda x: F.normalize(x, dim=-1)
+
         self.embedding = nn.Embedding(n_embeddings, embedding_dim)
 
         # Counter variable which contains the number of times each codebook is used
@@ -193,7 +195,8 @@ class Quantizer(nn.Module):
         self.init_parameters()
 
     def init_parameters(self):
-        self.embedding.weight.data.uniform_(-1/self.n_embeddings, 1/self.n_embeddings)
+        # self.embedding.weight.data.uniform_(-1/self.n_embeddings, 1/self.n_embeddings)
+        self.embedding.weight.data.normal_()
 
     def reinit_unused_codebook(self, dist_args=None):
         # TODO: cleanup dist code
@@ -205,35 +208,44 @@ class Quantizer(nn.Module):
 
         with torch.no_grad():
             if not dist_args.distributed or is_master(dist_args):
-                avg_probs = self.codebook_used / self.codebook_used.sum()
+                if self.codebook_used.sum() != 0.0:
+                    avg_probs = self.codebook_used / self.codebook_used.sum()
 
-                used = (avg_probs > self.usage_threshold)
-                if (used.sum() == self.n_embeddings) or (used.sum() == 0.0):
-                    return
-
-                used_vecs = self.embedding.weight[used]
-                samples = torch.randint(high=used.sum(), size=(reinit.shape[0],)).to(reinit.device)
-                reinit = used_vecs[samples]
-                reinit += torch.normal(mean=0.0, std=reinit.std()/100.0, size=reinit.shape).to(reinit.device)
-                print(f"Reinitialized {(~used).sum()} unused embeddings")
+                    used = (avg_probs > self.usage_threshold)
+                    if used.sum() != self.n_embeddings:
+                        used_vecs = self.embedding.weight[used]
+                        samples = torch.randint(high=used.sum(), size=(reinit.shape[0],)).to(reinit.device)
+                        reinit = used_vecs[samples]
+                        reinit += torch.normal(mean=0.0, std=1e-12, size=reinit.shape).to(reinit.device)
+                        print(f"Reinitialized {(~used).sum()} unused embeddings")
 
             if dist_args.distributed:
                 dist.broadcast(reinit, src=0)
                 dist.broadcast(used, src=0)
 
-            self.embedding.weight[~used] = reinit[~used]
+            if (~used).sum() > 0.0:
+                self.embedding.weight[~used] = reinit[~used]
             # TODO: maybe gradients for those need to be 0'd out for safety?
             # TODO: optimizer states?
         # Reset counter
         self.codebook_used *= 0.0
 
+
     def forward(self, f_emb):
         flat_input = f_emb.reshape(-1, self.embedding_dim)
 
+        flat_input_norm = self.norm(flat_input)
+        embedding_norm = self.norm(self.embedding.weight)
+
         # Calculate distances
+        '''
         distances = (torch.sum(flat_input**2, dim=1, keepdim=True) 
                     + torch.sum(self.embedding.weight**2, dim=1)
                     - 2 * torch.matmul(flat_input, self.embedding.weight.t()))
+        '''
+        distances = (torch.sum(flat_input_norm**2, dim=1, keepdim=True) 
+                    + torch.sum(embedding_norm**2, dim=1)
+                    - 2 * torch.matmul(flat_input_norm, embedding_norm.t()))
             
         # Encoding
         encoding_indices = torch.argmin(distances, dim=1).unsqueeze(1)
@@ -246,6 +258,7 @@ class Quantizer(nn.Module):
 
         # Quantize and unflatten
         quantized = torch.matmul(encodings, self.embedding.weight).reshape(f_emb.shape)
+        quantized, f_emb = self.norm(quantized), self.norm(f_emb)
 
         e_latent_loss = F.mse_loss(quantized.detach(), f_emb)
         q_latent_loss = F.mse_loss(quantized, f_emb.detach())

@@ -15,7 +15,7 @@ from torch import optim
 
 from dataloader import TokenLoader
 from distributed import is_master, init_distributed_device
-from evaluate import compute_acc_metrics, compute_usage_loss, evaluate_model
+from evaluate import compute_acc_metrics, compute_usage_loss, compute_perplexity, evaluate_model
 from model import VQVideo, EncoderConfig, DecoderConfig, QuantizerConfig, N_FRAME_TOKENS
 from params import parse_args
 
@@ -175,22 +175,32 @@ def main(args):
 
         opt.step()
 
+
+        log = {}
+
+        if args.check_usage_frequency == -1:
+            log["train/perplexity"] = latent_info['perplexity'].item() 
+        # Accurate perplexity calculation
+        elif (i % args.check_usage_frequency == 0):
+            mod = model.module.quantizer if args.distributed else model.quantizer
+            log["train/perplexity"] = compute_perplexity(mod, args)
+
         if (args.reinit_unused_codebook_frequency != -1) and (i % args.reinit_unused_codebook_frequency == 0):
             mod = model.module if args.distributed else model
             mod.quantizer.reinit_unused_codebook(args)
 
         batch_time = time.time() - t0
 
-        log = {
+        train_log = {
             "perf/step": i,
             "perf/data_time": data_time,
             "perf/batch_time": batch_time,
             "perf/tokens_s_gpu": X.numel()/batch_time,
             "train/reco_loss": reco_loss.item(),
             "train/latent_loss": latent_loss.item(),
-            "train/perplexity": latent_info['perplexity'].item(),
             "train/grad_norm": grad_norm.item(),
         }
+        log.update(train_log)
 
         # Evals
         acc_logs = compute_acc_metrics(true_logits.argmax(dim=-1), X, "train")

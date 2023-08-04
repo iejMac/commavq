@@ -185,21 +185,6 @@ def main(args):
             mod = model.module.quantizer if args.distributed else model.quantizer
             log["train/perplexity"] = compute_perplexity(mod, args)
 
-            '''
-            with torch.no_grad():
-                mod = model.module.quantizer if args.distributed else model.quantizer
-                temp_cu = mod.codebook_used.clone() if args.distributed else None
-                dist.reduce(mod.codebook_used, dst=0) if args.distributed else None
-
-                if not args.distributed or is_master(args):
-                    avg_probs = mod.codebook_used / mod.codebook_used.sum()
-                    log["train/perplexity"] = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-10)))
-                if args.distributed and is_master(args):
-                    mod.codebook_used = temp_cu
-                if args.reinit_unused_codebook_frequency == -1:
-                    mod.codebook_used *= 0.0
-            '''
-
         if (args.reinit_unused_codebook_frequency != -1) and (i % args.reinit_unused_codebook_frequency == 0):
             mod = model.module if args.distributed else model
             mod.quantizer.reinit_unused_codebook(args)

@@ -209,16 +209,16 @@ class Quantizer(nn.Module):
         with torch.no_grad():
             if not dist_args.distributed or is_master(dist_args):
                 if self.codebook_used.sum() != 0.0:
-                    avg_probs = self.codebook_used / self.codebook_used.sum()
 
-                    used = (avg_probs > self.usage_threshold)
-                    if used.sum() != self.n_embeddings:
-                        used_vecs = self.embedding.weight[used]
-                        samples = torch.randint(high=used.sum(), size=(reinit.shape[0],)).to(reinit.device)
-                        reinit = used_vecs[samples]
-                        # reinit += torch.normal(mean=0.0, std=1e-12, size=reinit.shape).to(reinit.device)
-                        reinit += torch.normal(mean=0.0, std=reinit.std()/100.0, size=reinit.shape).to(reinit.device)
-                        print(f"Reinitialized {(~used).sum()} unused embeddings")
+                     avg_probs = self.codebook_used / self.codebook_used.sum()
+
+                     used = (avg_probs > self.usage_threshold)
+                     if used.sum() != self.n_embeddings:
+                         used_vecs = self.embedding.weight[used]
+                         samples = torch.randint(high=used.sum(), size=(reinit.shape[0],)).to(reinit.device)
+                         reinit = used_vecs[samples]
+                         reinit += torch.normal(mean=0.0, std=1e-12, size=reinit.shape).to(reinit.device)
+                         print(f"Reinitialized {(~used).sum()} unused embeddings")
 
             if dist_args.distributed:
                 dist.broadcast(reinit, src=0)

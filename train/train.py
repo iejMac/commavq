@@ -6,6 +6,7 @@ import time
 import numpy as np
 import wandb
 import random
+import torch.distributed as dist
 
 from datetime import datetime
 from datasets import load_dataset
@@ -115,6 +116,7 @@ def main(args):
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[device], **ddp_args)
 
     # Opt Prep
+    
     opt = optim.AdamW(
         model.parameters(),
         lr=args.lr,
@@ -175,22 +177,47 @@ def main(args):
 
         opt.step()
 
+        log = {}
+
+        # TODO: make this work with reinit
+        if (i % args.check_usage_frequency == 0):
+            with torch.no_grad():
+                if args.distributed:
+                    mod = model.module.quantizer
+                    temp_cu = mod.codebook_used.clone()
+                    dist.reduce(mod.codebook_used, dst=0)
+
+                    if is_master(args):
+                        avg_probs = mod.codebook_used / mod.codebook_used.sum()
+                        mod.codebook_used = temp_cu
+                        log["train/perplexity"] = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-10)))
+                else:
+                    mod = model.quantizer
+                    avg_probs = mod.codebook_used / mod.codebook_used.sum()
+                    log["train/perplexity"] = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-10)))
+                # TODO: doesnt work with reinit since zeros out
+
+                if args.reinit_unused_codebook_frequency == -1:
+                    mod.codebook_used *= 0.0
+
         if (args.reinit_unused_codebook_frequency != -1) and (i % args.reinit_unused_codebook_frequency == 0):
             mod = model.module if args.distributed else model
             mod.quantizer.reinit_unused_codebook(args)
 
         batch_time = time.time() - t0
 
-        log = {
+        train_log = {
             "perf/step": i,
             "perf/data_time": data_time,
             "perf/batch_time": batch_time,
             "perf/tokens_s_gpu": X.numel()/batch_time,
             "train/reco_loss": reco_loss.item(),
             "train/latent_loss": latent_loss.item(),
-            "train/perplexity": latent_info['perplexity'].item(),
+            # "train/perplexity": latent_info['perplexity'].item(),
             "train/grad_norm": grad_norm.item(),
         }
+
+        log.update(train_log)
 
         # Evals
         acc_logs = compute_acc_metrics(true_logits.argmax(dim=-1), X, "train")
@@ -200,13 +227,13 @@ def main(args):
             mod = model.module if args.distributed else model
             usage_log = compute_usage_loss(mod, X)
             log.update(usage_log)
-        if (args.val_frequency != -1) and (i % args.val_frequency == 0):
+        if (args.val_frequency != -1) and (i % args.val_frequency == 0) and is_master(args):
             mod = model.module if args.distributed else model
             val_log = evaluate_model(mod, val_dataloader, args.val_steps)
             log.update(val_log)
 
         # Checkpointing
-        if (args.save_frequency != -1) and (i % args.save_frequency == 0):
+        if (args.save_frequency != -1) and (i % args.save_frequency == 0) and is_master(args):
             checkpoint_dict = {
                 "step": i,
                 "name": args.name,

@@ -216,7 +216,8 @@ class Quantizer(nn.Module):
                         used_vecs = self.embedding.weight[used]
                         samples = torch.randint(high=used.sum(), size=(reinit.shape[0],)).to(reinit.device)
                         reinit = used_vecs[samples]
-                        reinit += torch.normal(mean=0.0, std=1e-12, size=reinit.shape).to(reinit.device)
+                        # reinit += torch.normal(mean=0.0, std=1e-12, size=reinit.shape).to(reinit.device)
+                        reinit += torch.normal(mean=0.0, std=reinit.std()/100.0, size=reinit.shape).to(reinit.device)
                         print(f"Reinitialized {(~used).sum()} unused embeddings")
 
             if dist_args.distributed:

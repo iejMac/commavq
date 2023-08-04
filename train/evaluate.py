@@ -1,6 +1,25 @@
 import torch
+import torch.distributed as dist
 
 from torch.nn import functional as F
+
+from distributed import is_master
+
+
+def compute_perplexity(model, args):
+    with torch.no_grad():
+        temp_cu = model.codebook_used.clone() if args.distributed else None
+        dist.reduce(model.codebook_used, dst=0) if args.distributed else None
+
+        perplexity = 0.0
+        if not args.distributed or is_master(args):
+            avg_probs = model.codebook_used / model.codebook_used.sum()
+            perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-10)))
+        if args.distributed and is_master(args):
+            model.codebook_used = temp_cu
+        if args.reinit_unused_codebook_frequency == -1:
+            model.codebook_used *= 0.0
+        return perplexity
 
 
 def compute_acc_metrics(pred, X, split="train"):

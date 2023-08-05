@@ -239,11 +239,6 @@ class Quantizer(nn.Module):
         embedding_norm = self.norm(self.embedding.weight)
 
         # Calculate distances
-        '''
-        distances = (torch.sum(flat_input**2, dim=1, keepdim=True) 
-                    + torch.sum(self.embedding.weight**2, dim=1)
-                    - 2 * torch.matmul(flat_input, self.embedding.weight.t()))
-        '''
         distances = (torch.sum(flat_input_norm**2, dim=1, keepdim=True) 
                     + torch.sum(embedding_norm**2, dim=1)
                     - 2 * torch.matmul(flat_input_norm, embedding_norm.t()))

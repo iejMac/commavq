@@ -252,10 +252,11 @@ class Quantizer(nn.Module):
         encoding_indices = torch.argmin(distances, dim=1).unsqueeze(1)
         encodings = torch.zeros(encoding_indices.shape[0], self.n_embeddings, device=f_emb.device)
         encodings.scatter_(1, encoding_indices, 1)
-        
-        with torch.no_grad():
-            used = torch.bincount(encoding_indices.flatten(), minlength=self.n_embeddings)
-            self.codebook_used += used
+
+        if self.training:
+            with torch.no_grad():
+                used = torch.bincount(encoding_indices.flatten(), minlength=self.n_embeddings)
+                self.codebook_used += used
 
         # Quantize and unflatten
         quantized = torch.matmul(encodings, self.embedding.weight).reshape(f_emb.shape)

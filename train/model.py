@@ -136,15 +136,9 @@ class Decoder(nn.Module):
         torch.nn.init.normal_(self.pred_head.weight, mean=0.0, std=0.02/math.sqrt(2*self.transformer.layers))
         # torch.nn.init.normal_(self.pred_head.weight, mean=0.0, std=proj_std)
 
-    def build_attention_mask(self, ctx_len):
-        # lazily create causal attention mask, with full attention between the tokens
-        # pytorch uses additive attention mask; fill with -inf
-
-        # TODO: might need to build attn mask every time for dynamic stuff
-        # TODO: try out blocked attention masks (frame is atomic element)
-        mask = torch.empty(ctx_len, ctx_len)
-        mask.fill_(float("-inf"))
-        mask.triu_(1)  # zero out the lower diagonal
+    def build_attention_mask(self, ctx_len, dynamics_size):
+        mask = torch.zeros(ctx_len, ctx_len)
+        mask[:, dynamics_size:] = float('-inf')
         return mask
         
     def forward(self, x, f):
@@ -160,9 +154,13 @@ class Decoder(nn.Module):
 
         fx = fx + p_embs
 
+        dropout = torch.randint(1, 4, (1,)).item()
+        attn_mask = self.build_attention_mask(self.n_input_tokens, N_FRAME_TOKENS + 1 + dropout*32).to(fx.device)
+
         fx = fx.permute(1, 0, 2)  # NLD -> LND
         # y = self.transformer(fx, attn_mask=self.attn_mask)
-        y = self.transformer(fx)
+        y = self.transformer(fx, attn_mask=attn_mask)
+        # y = self.transformer(fx)
         y = y.permute(1, 0, 2)  # LND -> NLD
 
         logits = self.pred_head(y)

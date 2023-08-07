@@ -74,6 +74,7 @@ def main(args):
     quantized_width = model_config['quantizer_cfg']['embedding_dim']
     n_dynamics_tokens = model_config['n_dynamics_tokens']
 
+    # TODO: this doesn't need to be frozen
     spatial_embeddings = torch.load(model_config['spatial_embedding'])
     spatial_embeddings.requires_grad = False
 

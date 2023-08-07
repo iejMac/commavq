@@ -15,7 +15,7 @@ from torch import optim
 
 from dataloader import TokenLoader
 from distributed import is_master, init_distributed_device
-from evaluate import compute_acc_metrics, compute_usage_loss, evaluate_model
+from evaluate import compute_acc_metrics, compute_usage_loss, compute_perplexity, evaluate_model
 from model import VQVideo, EncoderConfig, DecoderConfig, QuantizerConfig, N_FRAME_TOKENS
 from params import parse_args
 
@@ -74,6 +74,7 @@ def main(args):
     quantized_width = model_config['quantizer_cfg']['embedding_dim']
     n_dynamics_tokens = model_config['n_dynamics_tokens']
 
+    # TODO: this doesn't need to be frozen
     spatial_embeddings = torch.load(model_config['spatial_embedding'])
     spatial_embeddings.requires_grad = False
 
@@ -175,58 +176,72 @@ def main(args):
 
         opt.step()
 
+        log = {}
+
+        if args.check_usage_frequency == -1:
+            log["train/perplexity"] = latent_info['perplexity'].item() 
+        # Accurate perplexity calculation
+        elif (i % args.check_usage_frequency == 0):
+            mod = model.module.quantizer if args.distributed else model.quantizer
+            log["train/perplexity"] = compute_perplexity(mod, args)
+
         if (args.reinit_unused_codebook_frequency != -1) and (i % args.reinit_unused_codebook_frequency == 0):
             mod = model.module if args.distributed else model
             mod.quantizer.reinit_unused_codebook(args)
 
         batch_time = time.time() - t0
 
-        log = {
+        train_log = {
             "perf/step": i,
             "perf/data_time": data_time,
             "perf/batch_time": batch_time,
             "perf/tokens_s_gpu": X.numel()/batch_time,
             "train/reco_loss": reco_loss.item(),
             "train/latent_loss": latent_loss.item(),
-            "train/perplexity": latent_info['perplexity'].item(),
             "train/grad_norm": grad_norm.item(),
         }
+        log.update(train_log)
+        
+        # Evals + Logging
+        if is_master(args):
+            model.eval()
+            ns = [1]
+            if args.n_frames > 2:
+                ns.append(args.n_frames - 1)
 
-        # Evals
-        ns = [1]
-        if args.n_frames > 2:
-            ns.append(args.n_frames - 1)
-        acc_logs = compute_acc_metrics(true_logits.argmax(dim=-1), X, ns, "train")
-        log.update(acc_logs)
-        # Check if you're using f embedding and x0 together
-        if (args.check_usage_frequency != -1) and (i % args.check_usage_frequency == 0) and is_master(args):
-            mod = model.module if args.distributed else model
-            usage_log = compute_usage_loss(mod, X)
-            log.update(usage_log)
-        if (args.val_frequency != -1) and (i % args.val_frequency == 0):
-            mod = model.module if args.distributed else model
-            val_log = evaluate_model(mod, val_dataloader, args.val_steps)
-            log.update(val_log)
+            acc_logs = compute_acc_metrics(true_logits.argmax(dim=-1), X, ns, "train")
+            log.update(acc_logs)
 
-        # Checkpointing
-        if (args.save_frequency != -1) and (i % args.save_frequency == 0):
-            checkpoint_dict = {
-                "step": i,
-                "name": args.name,
-                "state_dict": model.state_dict(),
-                "optimizer": opt.state_dict(),
-            }
+            # Check if you're using f embedding and x0 together
+            if (args.check_usage_frequency != -1) and (i % args.check_usage_frequency == 0):
+                mod = model.module if args.distributed else model
+                usage_log = compute_usage_loss(mod, X)
+                log.update(usage_log)
+            if (args.val_frequency != -1) and (i % args.val_frequency == 0):
+                mod = model.module if args.distributed else model
+                val_log = evaluate_model(mod, val_dataloader, args.val_steps)
+                log.update(val_log)
+            model.train()
 
-            checkpoint_name = os.path.join(args.checkpoint_path, f"step_{'latest' if args.save_most_recent else i}.pth")
-            torch.save(checkpoint_dict, checkpoint_name)
+            # Checkpointing
+            if (args.save_frequency != -1) and (i % args.save_frequency == 0):
+                checkpoint_dict = {
+                    "step": i,
+                    "name": args.name,
+                    "state_dict": model.state_dict(),
+                    "optimizer": opt.state_dict(),
+                }
 
-        if (i % args.log_every_n_steps == 0) and is_master(args):
-            print(f"Step {i}")
-            print("--------")
-            for name, val in log.items():
-                print(f"{name}: {val}")
-            if args.enable_wandb:
-                wandb.log(log)
+                checkpoint_name = os.path.join(args.checkpoint_path, f"step_{'latest' if args.save_most_recent else i}.pth")
+                torch.save(checkpoint_dict, checkpoint_name)
+
+            if (i % args.log_every_n_steps == 0):
+                print(f"Step {i}")
+                print("--------")
+                for name, val in log.items():
+                    print(f"{name}: {val}")
+                if args.enable_wandb:
+                    wandb.log(log)
 
         i += 1
         t0 = time.time()

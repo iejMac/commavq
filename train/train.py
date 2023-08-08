@@ -213,7 +213,7 @@ def main(args):
             acc_logs = compute_acc_metrics(true_logits.argmax(dim=-1), X, ns, "train")
             log.update(acc_logs)
 
-            # Check if you're using f embedding and x0 together
+            # Check if you're using f embedding and x together
             if (args.check_usage_frequency != -1) and (i % args.check_usage_frequency == 0):
                 mod = model.module if args.distributed else model
                 usage_log = compute_usage_loss(mod, X)

@@ -69,9 +69,14 @@ class RotaryWithCast(RotaryEmbedding):
 
 
 def xformers_attn(queries, keys, values, attn_mask):
-    # TODO: don't do this here
-    if attn_mask is not None:
-        attn_mask = attn_mask.to(dtype=queries.dtype)
+    # TODO: maybe this is too slow
+    # not sure how to make it so attn_maks doesn't change stride during forward
+    if attn_mask is not None and attn_mask.shape[0] % 8 != 0:
+        seq_len = attn_mask.shape[0]
+        closest_8k = math.ceil(seq_len/8) * 8
+        big_attn_mask = torch.zeros((closest_8k, closest_8k), device=attn_mask.device, dtype=attn_mask.dtype)
+        big_attn_mask[:seq_len, :seq_len] = attn_mask
+        attn_mask = big_attn_mask[:seq_len, :seq_len]
     return xops.memory_efficient_attention(queries, keys, values, attn_bias=attn_mask)
 
 
@@ -96,7 +101,6 @@ class CustomAttn(nn.Module):
         )
 
         # set attn mask
-        # self.attn_mask = None
         if attn_mask is not None:
             self.register_buffer('attn_mask', attn_mask, persistent=False)
         else:

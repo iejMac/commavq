@@ -100,7 +100,8 @@ def main(args):
         encoder_config=encoder_config,
         decoder_config=decoder_config,
         quantizer_config=quantizer_config,
-        spatial_embeddings = spatial_embeddings,
+        spatial_embeddings=spatial_embeddings,
+        precision=args.precision,
     ).to(device)
     model.device = device
 

@@ -108,7 +108,7 @@ class DecoderConfig:
     spatial_embeddings: torch.Tensor = None
 
 class Decoder(nn.Module):
-    def __init__(self, width, layers, heads, n_dynamics_tokens, n_frames, weight_tying, spatial_embeddings=None):
+    def __init__(self, width, layers, heads, n_dynamics_tokens, n_frames, weight_tying, spatial_embeddings=None, precision="amp"):
         super().__init__()
         self.width = width
         self.layers = layers
@@ -120,7 +120,9 @@ class Decoder(nn.Module):
 
         n_input_tokens = (n_frames - 1) * (N_FRAME_TOKENS + 1 + n_dynamics_tokens + 1)
         attn_mask = self.build_attention_mask(N_FRAME_TOKENS, n_dynamics_tokens, n_frames-1)
-
+        
+        # TODO: only when amp
+        attn_mask = attn_mask.to(dtype=torch.bfloat16) if precision == "amp" else attn_mask
         transformer_params = Params(
             dim=width,
             n_layers=layers,
@@ -320,7 +322,7 @@ class Quantizer(nn.Module):
 
 
 class VQVideo(nn.Module):
-    def __init__(self, encoder_config, decoder_config, quantizer_config, spatial_embeddings):
+    def __init__(self, encoder_config, decoder_config, quantizer_config, spatial_embeddings, precision="amp"):
         super().__init__()
         self.width = decoder_config.width
         self.n_dynamics_tokens = encoder_config.n_dynamics_tokens
@@ -345,7 +347,8 @@ class VQVideo(nn.Module):
             n_dynamics_tokens=decoder_config.n_dynamics_tokens,
             n_frames=decoder_config.n_frames,
             weight_tying=decoder_config.weight_tying,
-            spatial_embeddings = spatial_embeddings,
+            spatial_embeddings=spatial_embeddings,
+            precision=precision,
         )
         self.quantizer = Quantizer(
             n_embeddings=quantizer_config.n_embeddings,

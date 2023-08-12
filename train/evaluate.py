@@ -1,6 +1,7 @@
 import torch
 import torch.distributed as dist
 
+from contextlib import suppress
 from torch.nn import functional as F
 from model import N_FRAME_TOKENS
 
@@ -48,13 +49,13 @@ def compute_acc_metrics(pred, X, ns=[1], split="train"):
     return acc_log
 
 
-def compute_usage_loss(model, X, split="train"):
+def compute_usage_loss(model, X, split="train", autocast=suppress):
     usage_log = {}
     xs = X[:, :-1].long()
     xs = xs.reshape(xs.shape[0], xs.shape[1], -1)
     prep_labels = X[:, 1:].reshape(X.shape[0], -1).reshape(-1)
     
-    with torch.no_grad():
+    with torch.no_grad(), autocast():
         fake_encodings = torch.randint(0, model.quantizer.n_embeddings, (xs.shape[0], model.n_dynamics_tokens * (model.encoder.n_frames - 1))).long().to(X.device)
         fake_f = model.diff_proj(model.quantizer.embedding.weight[fake_encodings])
         fake_xs = torch.randint(0, 1024, xs.shape).long().to(X.device)
@@ -73,7 +74,7 @@ def compute_usage_loss(model, X, split="train"):
     return usage_log 
 
 
-def evaluate_model(model, val_dataloader, n_steps):
+def evaluate_model(model, val_dataloader, n_steps, autocast=suppress):
     val_log = {
         "val/reco_loss": 0.0,
         "val/unused_f_loss": 0.0,
@@ -91,7 +92,7 @@ def evaluate_model(model, val_dataloader, n_steps):
         val_log[f"val/x{n-1}_x{n}_eq"] = 0.0
 
     i = 0
-    with torch.no_grad():
+    with torch.no_grad(), autocast():
         for X in val_dataloader:
             if i >= n_steps:
                 break
@@ -107,7 +108,7 @@ def evaluate_model(model, val_dataloader, n_steps):
             step_log["val/reco_loss"] = reco_loss.item()
 
             step_log.update(compute_acc_metrics(true_logits.argmax(dim=-1), X, ns, "val"))
-            step_log.update(compute_usage_loss(model, X, "val"))
+            step_log.update(compute_usage_loss(model, X, "val", autocast=autocast))
 
             for k, v in step_log.items():
                 val_log[k] += v

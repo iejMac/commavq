@@ -7,6 +7,7 @@ import numpy as np
 import wandb
 import random
 
+from contextlib import suppress
 from datetime import datetime
 from datasets import load_dataset
 from torch import nn
@@ -103,6 +104,8 @@ def main(args):
     ).to(device)
     model.device = device
 
+    autocast = (lambda: torch.cuda.amp.autocast(dtype=torch.bfloat16)) if args.precision == 'amp' else suppress
+
     random_seed(args.seed, args.rank)
 
     if is_master(args):
@@ -126,12 +129,14 @@ def main(args):
 
     start_step = 1
     if args.resume is not None:
+        # TODO: maybe consider changing seed here
         checkpoint = torch.load(args.resume, map_location='cpu')
         if 'step' in checkpoint:
-            start_step = checkpoint['step']
+            start_step = checkpoint['step'] + 1
             sd = checkpoint['state_dict']
             if not args.distributed and next(iter(sd.items()))[0].startswith('module'):
                 sd = {k[len('module.'):]: v for k, v in sd.items()}
+
             model.load_state_dict(sd)
             opt.load_state_dict(checkpoint['optimizer'])
         else:
@@ -152,7 +157,8 @@ def main(args):
         # Forward pass
         opt.zero_grad()
 
-        true_logits, latent_info = model(X)
+        with autocast():
+            true_logits, latent_info = model(X)
 
         prep_logits, prep_labels = true_logits.reshape(-1, 1024), labels.reshape(-1)
         reco_loss = F.cross_entropy(prep_logits, prep_labels)
@@ -212,14 +218,14 @@ def main(args):
             acc_logs = compute_acc_metrics(true_logits.argmax(dim=-1), X, ns, "train")
             log.update(acc_logs)
 
-            # Check if you're using f embedding and x0 together
+            # Check if you're using f embedding and x together
             if (args.check_usage_frequency != -1) and (i % args.check_usage_frequency == 0):
                 mod = model.module if args.distributed else model
-                usage_log = compute_usage_loss(mod, X)
+                usage_log = compute_usage_loss(mod, X, autocast=autocast)
                 log.update(usage_log)
             if (args.val_frequency != -1) and (i % args.val_frequency == 0):
                 mod = model.module if args.distributed else model
-                val_log = evaluate_model(mod, val_dataloader, args.val_steps)
+                val_log = evaluate_model(mod, val_dataloader, args.val_steps, autocast=autocast)
                 log.update(val_log)
             model.train()
 

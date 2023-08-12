@@ -40,8 +40,8 @@ class Encoder(nn.Module):
         self.pos_emb = nn.Embedding(n_frames*N_FRAME_TOKENS + n_frames, width)
         self.output_dim = width if output_dim == -1 else output_dim
 
-        start_indices = torch.arange(0, (n_frames - 1) * N_FRAME_TOKENS, N_FRAME_TOKENS)
-        dynamics_inds = torch.cat([start_indices + i for i in range(n_dynamics_tokens)])
+        start_indices = torch.arange(N_FRAME_TOKENS + 1, self.n_frames * (N_FRAME_TOKENS + 1), N_FRAME_TOKENS + 1)
+        dynamics_inds = torch.stack([start_indices + i for i in range(self.n_dynamics_tokens)]).T.reshape(-1)
         self.register_buffer('dynamics_inds', dynamics_inds, persistent=False)
 
         self.proj = nn.Linear(self.width, self.output_dim, bias=False)
@@ -62,7 +62,6 @@ class Encoder(nn.Module):
 
         # nn.init.normal_(self.proj.weight, mean=0.0, std=proj_std)
 
-
     def forward(self, embs):
         embs = torch.cat((
             embs,
@@ -82,11 +81,7 @@ class Encoder(nn.Module):
         # c_embs = self.ln_final(c_embs)
         c_embs = self.proj(c_embs)
 
-        f = c_embs.index_select(1, self.dynamics_inds)
-
-        # TODO: very weakly matters but changes loss curve so I'll keep this
-        # f = c_embs[:, :self.n_dynamics_tokens]  # transformation is bottlenecked
-        # f = c_embs[:, -self.n_dynamics_tokens:]  # transformation is bottlenecked
+        f = c_embs[:, self.dynamics_inds]
         return f
 
 
@@ -123,12 +118,15 @@ class Decoder(nn.Module):
 
         scale = width ** -0.5
         self.frame_delim = nn.Parameter(torch.randn(width) * scale)
-        # n_input_tokens = N_FRAME_TOKENS + n_dynamics_tokens * (n_frames - 1) + n_frames
-        n_input_tokens = N_FRAME_TOKENS * n_frames
+        n_input_tokens = (n_frames - 1) * (N_FRAME_TOKENS + 1 + n_dynamics_tokens + 1)
         self.pos_emb = nn.Embedding(n_input_tokens, width)
 
-        full_attn_mask = self.build_attention_mask(n_input_tokens, N_FRAME_TOKENS)
+        full_attn_mask = self.build_attention_mask(N_FRAME_TOKENS, n_dynamics_tokens, n_frames-1)
         self.register_buffer('attn_mask', full_attn_mask, persistent=False)
+
+        start_indices = torch.arange(0, (n_frames - 1) * (N_FRAME_TOKENS + n_dynamics_tokens + 2), (N_FRAME_TOKENS + n_dynamics_tokens + 2))
+        logit_inds = torch.stack([start_indices + i for i in range(N_FRAME_TOKENS)]).T.reshape(-1)
+        self.register_buffer('logit_inds', logit_inds, persistent=False)
 
         self.init_parameters()
 
@@ -148,35 +146,55 @@ class Decoder(nn.Module):
         torch.nn.init.normal_(self.pred_head.weight, mean=0.0, std=0.02/math.sqrt(2*self.transformer.layers))
         # torch.nn.init.normal_(self.pred_head.weight, mean=0.0, std=proj_std)
 
-    def build_attention_mask(self, seq_len, block_size):
-        # lazily create causal attention mask, with full attention between the tokens
-        # pytorch uses additive attention mask; fill with -inf
+    def build_attention_mask(self, f, t, n):
         '''
-        # token level
-        mask = torch.empty(ctx_len, ctx_len)
-        mask.fill_(float("-inf"))
-        mask.triu_(1)  # zero out the lower diagonal
         '''
 
+        '''
         # block level
         mask = torch.full((seq_len, seq_len), float('-inf'))
         # Block diagonal mask should have ones (i.e., zero out after fill with '-inf')
         for i in range(0, seq_len, block_size):
             mask[i:i+block_size, :i+block_size] = 0  # unmask block diagonal
+        '''
+        seq_len = n * (f + t + 2)
+        mask = torch.full((seq_len, seq_len), float('-inf'))
+
+        # Allow each token to attend to itself by default
+        for idx in range(seq_len):
+            mask[idx, idx] = 0
+
+        for i in range(n):
+            # start index for each F sequence
+            f_start = i * (f + t + 2)
+            
+            # unmask positions in the F sequence itself
+            mask[f_start:f_start+f, f_start:f_start+f] = 0
+            
+            # unmask positions in the previous D (if it exists)
+            if f_start - 1 >= 0:
+                mask[f_start:f_start+f, f_start-1] = 0
+            
+            # unmask positions in all previous D, T sequences
+            for j in range(i):
+                d_start = j * (f + t + 2) + f
+                mask[f_start:f_start+f, d_start:d_start+t+1] = 0
+
+            # unmask positions in the following D, T sequence
+            next_d_start = f_start + f
+            mask[f_start:f_start+f, next_d_start:next_d_start+t+1] = 0
+
         return mask
         
     def forward(self, x, f):
         f = f.reshape(f.shape[0], -1, self.n_dynamics_tokens, self.width)
 
-        f = torch.cat((
-            self.frame_delim + torch.zeros(f.shape[0], f.shape[1], N_FRAME_TOKENS-self.n_dynamics_tokens, f.shape[-1], dtype=f.dtype, device=f.device),
-            f,
-        ), dim=-2)
-
-        fx = torch.cat([
+        fx = torch.cat((
             x,
-            f.reshape(f.shape[0], -1, f.shape[-1]),
-        ], dim=1)  # concat space code with transformation code
+            self.frame_delim + torch.zeros(f.shape[0], f.shape[1], 1, f.shape[-1], dtype=f.dtype, device=f.device),
+            f,
+            self.frame_delim + torch.zeros(f.shape[0], f.shape[1], 1, f.shape[-1], dtype=f.dtype, device=f.device),
+        ), dim=-2).reshape(x.shape[0], -1, x.shape[-1])
 
         pos = torch.arange(0, fx.shape[1], dtype=torch.long, device=x.device).unsqueeze(0) 
         p_embs = self.pos_emb(pos)
@@ -185,14 +203,13 @@ class Decoder(nn.Module):
 
         fx = fx.permute(1, 0, 2)  # NLD -> LND
         y = self.transformer(fx, attn_mask=self.attn_mask)
-        # y = self.transformer(fx)
-        y = y.permute(1, 0, 2)  # LND -> NLD
-
+        y = y.permute(1, 0, 2)  # LND -> NLD 
         if self.final_proj is not None:
             y = self.final_proj(y)
 
         logits = self.pred_head(y)
-        return logits
+        true_logits = logits[:, self.logit_inds]
+        return true_logits
 
 
 @dataclass
@@ -223,7 +240,7 @@ class Quantizer(nn.Module):
     def reinit_unused_codebook(self, dist_args=None):
         # TODO: cleanup dist code
         reinit = torch.empty_like(self.embedding.weight, device=dist_args.device) 
-        used = torch.empty(self.n_embeddings, dtype=torch.bool, device=dist_args.device)
+        used = torch.ones(self.n_embeddings, dtype=torch.bool, device=dist_args.device)
 
         if dist_args.distributed:
             dist.reduce(self.codebook_used, dst=0)
@@ -264,7 +281,6 @@ class Quantizer(nn.Module):
         encoding_indices = torch.argmin(distances, dim=1).unsqueeze(1)
         encodings = torch.zeros(encoding_indices.shape[0], self.n_embeddings, device=f_emb.device)
         encodings.scatter_(1, encoding_indices, 1)
-
         if self.training:
             with torch.no_grad():
                 used = torch.bincount(encoding_indices.flatten(), minlength=self.n_embeddings)
@@ -328,13 +344,7 @@ class VQVideo(nn.Module):
     def decode(self, x, f):
         x = self.spatial_embeddings[x]
         x = self.frame_proj(x)
-        logits = self.decoder(x, f)
-
-        true_logits = logits[:, N_FRAME_TOKENS:]
-        # TODO: very weakly matters but changes loss curve so I'll keep this
-        # used to just not work for the second one, now it works fine
-        # true_logits = logits[:, :N_FRAME_TOKENS]  # for now only one frame
-        # true_logits = logits[:, -N_FRAME_TOKENS:]
+        true_logits = self.decoder(x, f)
         return true_logits
 
     def forward(self, x):
@@ -348,7 +358,7 @@ class VQVideo(nn.Module):
         latent_info = {'latent_loss': latent_loss, 'perplexity': ppl, 'encodings': encodings}
         f = self.diff_proj(f)
 
-        x0 = x[:, 0].reshape(x.shape[0], -1).long()
-        logits = self.decode(x0, f)
+        xs = x[:, :-1]
+        logits = self.decode(xs, f)
 
         return logits, latent_info

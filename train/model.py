@@ -8,7 +8,25 @@ from torch import nn
 from torch.nn import functional as F
 
 from distributed import is_master
-from transformer import Transformer
+from transformer import Transformer, Params
+
+
+def sinusoidal_positional_embedding(token_sequence_size, token_embedding_dim, n=10000.0):
+
+    if token_embedding_dim % 2 != 0:
+        raise ValueError("Sinusoidal positional embedding cannot apply to odd token embedding dim (got dim={:d})".format(token_embedding_dim))
+
+    T = token_sequence_size
+    d = token_embedding_dim #d_model=head_num*d_k, not d_q, d_k, d_v
+
+    positions = torch.arange(0, T).unsqueeze_(1)
+    embeddings = torch.zeros(T, d)
+
+    denominators = torch.pow(n, 2*torch.arange(0, d//2)/d) # 10000^(2i/d_model), i is the index of embedding
+    embeddings[:, 0::2] = torch.sin(positions/denominators) # sin(pos/10000^(2i/d_model))
+    embeddings[:, 1::2] = torch.cos(positions/denominators) # cos(pos/10000^(2i/d_model))
+
+    return embeddings
 
 
 N_FRAME_TOKENS = 128
@@ -32,12 +50,26 @@ class Encoder(nn.Module):
         self.n_frames = n_frames
         self.output_dim = output_dim
 
-        self.transformer = Transformer(width, layers, heads)
+
+        n_input_tokens = n_frames * (N_FRAME_TOKENS + 1)
+        transformer_params = Params(
+            dim=width,
+            n_layers=layers,
+            n_heads=heads,
+            norm_eps=1e-5,
+            seq_len=n_input_tokens,
+            post_embed_norm=False,
+        )
+        self.transformer = Transformer(transformer_params)
+
+        # self.transformer = Transformer(width, layers, heads)
 
         scale = width ** -0.5
         self.frame_delim = nn.Parameter(torch.randn(width) * scale)
 
-        self.pos_emb = nn.Embedding(n_frames*N_FRAME_TOKENS + n_frames, width)
+        # self.pos_emb = nn.Embedding(n_frames*N_FRAME_TOKENS + n_frames, width)
+        self.pos_emb = sinusoidal_positional_embedding(n_input_tokens, width)
+        self.pos_emb.requires_grad=False
         self.output_dim = width if output_dim == -1 else output_dim
 
         start_indices = torch.arange(N_FRAME_TOKENS + 1, self.n_frames * (N_FRAME_TOKENS + 1), N_FRAME_TOKENS + 1)
@@ -48,8 +80,9 @@ class Encoder(nn.Module):
         self.init_parameters()
 
     def init_parameters(self):
-        nn.init.normal_(self.pos_emb.weight, std=0.01)
+        # nn.init.normal_(self.pos_emb.weight, std=0.01)
 
+        '''
         proj_std = (self.transformer.width ** -0.5) * ((2 * self.transformer.layers) ** -0.5)
         attn_std = self.transformer.width ** -0.5
         fc_std = (2 * self.transformer.width) ** -0.5
@@ -61,6 +94,7 @@ class Encoder(nn.Module):
             nn.init.normal_(block.mlp.c_proj.weight, std=proj_std)
 
         # nn.init.normal_(self.proj.weight, mean=0.0, std=proj_std)
+        '''
 
     def forward(self, embs):
         embs = torch.cat((
@@ -69,14 +103,15 @@ class Encoder(nn.Module):
         ), dim=-2)
         embs = embs.reshape(embs.shape[0], -1, embs.shape[-1])
 
-        pos = torch.arange(0, embs.shape[1], dtype=torch.long, device=embs.device).unsqueeze(0) 
-        p_embs = self.pos_emb(pos)
+        pos = torch.arange(0, embs.shape[1], dtype=torch.long, device=embs.device).unsqueeze(0).to(embs.device)
+        # p_embs = self.pos_emb(pos)
+        self.pos_emb = self.pos_emb.to(embs.device)
+        p_embs = self.pos_emb[pos]
 
         t_embs = embs + p_embs
+        # t_embs = embs
 
-        t_embs = t_embs.permute(1, 0, 2)  # NLD -> LND
         c_embs = self.transformer(t_embs)
-        c_embs = c_embs.permute(1, 0, 2)  # LND -> NLD
 
         # c_embs = self.ln_final(c_embs)
         c_embs = self.proj(c_embs)
@@ -96,7 +131,7 @@ class DecoderConfig:
     spatial_embeddings: torch.Tensor = None
 
 class Decoder(nn.Module):
-    def __init__(self, width, layers, heads, n_dynamics_tokens, n_frames, weight_tying, spatial_embeddings=None):
+    def __init__(self, width, layers, heads, n_dynamics_tokens, n_frames, weight_tying, spatial_embeddings=None, precision="amp"):
         super().__init__()
         self.width = width
         self.layers = layers
@@ -105,7 +140,22 @@ class Decoder(nn.Module):
         self.n_frames = n_frames
         self.weight_tying = weight_tying
 
-        self.transformer = Transformer(width, layers, heads)
+
+        n_input_tokens = (n_frames - 1) * (N_FRAME_TOKENS + 1 + n_dynamics_tokens + 1)
+        attn_mask = self.build_attention_mask(N_FRAME_TOKENS, n_dynamics_tokens, n_frames-1)
+        
+        # TODO: only when amp
+        attn_mask = attn_mask.to(dtype=torch.bfloat16) if precision == "amp" else attn_mask
+        transformer_params = Params(
+            dim=width,
+            n_layers=layers,
+            n_heads=heads,
+            norm_eps=1e-5,
+            seq_len=n_input_tokens,
+            post_embed_norm=False,
+        )
+        self.transformer = Transformer(transformer_params, attn_mask=attn_mask)
+
         self.final_proj = None
         self.pred_head = nn.Linear(width, 1024, bias=False)
         self.weight_tying = weight_tying
@@ -118,11 +168,10 @@ class Decoder(nn.Module):
 
         scale = width ** -0.5
         self.frame_delim = nn.Parameter(torch.randn(width) * scale)
-        n_input_tokens = (n_frames - 1) * (N_FRAME_TOKENS + 1 + n_dynamics_tokens + 1)
-        self.pos_emb = nn.Embedding(n_input_tokens, width)
+        # self.pos_emb = nn.Embedding(n_input_tokens, width)
+        self.pos_emb = sinusoidal_positional_embedding(n_input_tokens, width)
+        self.pos_emb.requires_grad=False
 
-        full_attn_mask = self.build_attention_mask(N_FRAME_TOKENS, n_dynamics_tokens, n_frames-1)
-        self.register_buffer('attn_mask', full_attn_mask, persistent=False)
 
         start_indices = torch.arange(0, (n_frames - 1) * (N_FRAME_TOKENS + n_dynamics_tokens + 2), (N_FRAME_TOKENS + n_dynamics_tokens + 2))
         logit_inds = torch.stack([start_indices + i for i in range(N_FRAME_TOKENS)]).T.reshape(-1)
@@ -132,7 +181,8 @@ class Decoder(nn.Module):
 
     def init_parameters(self):
         # TODO: try init here like karpathy (this is decoder)
-        nn.init.normal_(self.pos_emb.weight, std=0.01)
+        # nn.init.normal_(self.pos_emb.weight, std=0.01)
+        '''
 
         proj_std = (self.transformer.width ** -0.5) * ((2 * self.transformer.layers) ** -0.5)
         attn_std = self.transformer.width ** -0.5
@@ -142,14 +192,12 @@ class Decoder(nn.Module):
             nn.init.normal_(block.attn.out_proj.weight, std=proj_std)
             nn.init.normal_(block.mlp.c_fc.weight, std=fc_std)
             nn.init.normal_(block.mlp.c_proj.weight, std=proj_std)
-
-        torch.nn.init.normal_(self.pred_head.weight, mean=0.0, std=0.02/math.sqrt(2*self.transformer.layers))
+        '''
+        # torch.nn.init.normal_(self.pred_head.weight, mean=0.0, std=0.02/math.sqrt(2*self.transformer.layers))
+        torch.nn.init.normal_(self.pred_head.weight, mean=0.0, std=0.02/math.sqrt(2*self.layers))
         # torch.nn.init.normal_(self.pred_head.weight, mean=0.0, std=proj_std)
 
     def build_attention_mask(self, f, t, n):
-        '''
-        '''
-
         '''
         # block level
         mask = torch.full((seq_len, seq_len), float('-inf'))
@@ -196,14 +244,15 @@ class Decoder(nn.Module):
             self.frame_delim + torch.zeros(f.shape[0], f.shape[1], 1, f.shape[-1], dtype=f.dtype, device=f.device),
         ), dim=-2).reshape(x.shape[0], -1, x.shape[-1])
 
-        pos = torch.arange(0, fx.shape[1], dtype=torch.long, device=x.device).unsqueeze(0) 
-        p_embs = self.pos_emb(pos)
+        pos = torch.arange(0, fx.shape[1], dtype=torch.long, device=x.device).unsqueeze(0).to(x.device)
+        self.pos_emb = self.pos_emb.to(x.device)
+        # p_embs = self.pos_emb(pos)
+        p_embs = self.pos_emb[pos]
 
         fx = fx + p_embs
 
-        fx = fx.permute(1, 0, 2)  # NLD -> LND
-        y = self.transformer(fx, attn_mask=self.attn_mask)
-        y = y.permute(1, 0, 2)  # LND -> NLD 
+        y = self.transformer(fx)
+
         if self.final_proj is not None:
             y = self.final_proj(y)
 
@@ -301,7 +350,7 @@ class Quantizer(nn.Module):
 
 
 class VQVideo(nn.Module):
-    def __init__(self, encoder_config, decoder_config, quantizer_config, spatial_embeddings):
+    def __init__(self, encoder_config, decoder_config, quantizer_config, spatial_embeddings, precision="amp"):
         super().__init__()
         self.width = decoder_config.width
         self.n_dynamics_tokens = encoder_config.n_dynamics_tokens
@@ -311,14 +360,13 @@ class VQVideo(nn.Module):
         self.frame_proj = nn.Linear(256, self.width, bias=False)
         self.diff_proj = nn.Linear(quantizer_config.embedding_dim, self.width, bias=False)
 
-
         self.encoder = Encoder(
             width=encoder_config.width,
             layers=encoder_config.layers,
             heads=encoder_config.heads,
             n_dynamics_tokens=encoder_config.n_dynamics_tokens,
             n_frames=encoder_config.n_frames,
-            output_dim=encoder_config.output_dim,
+            output_dim=quantizer_config.embedding_dim,
         )
         self.decoder = Decoder(
             width=decoder_config.width,
@@ -327,7 +375,8 @@ class VQVideo(nn.Module):
             n_dynamics_tokens=decoder_config.n_dynamics_tokens,
             n_frames=decoder_config.n_frames,
             weight_tying=decoder_config.weight_tying,
-            spatial_embeddings = spatial_embeddings,
+            spatial_embeddings=spatial_embeddings,
+            precision=precision,
         )
         self.quantizer = Quantizer(
             n_embeddings=quantizer_config.n_embeddings,

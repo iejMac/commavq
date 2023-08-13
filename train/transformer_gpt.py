@@ -2,6 +2,7 @@ import math
 import json
 import re
 from copy import deepcopy
+from collections import OrderedDict
 from pathlib import Path
 from dataclasses import dataclass
 
@@ -87,10 +88,11 @@ class CustomAttn(nn.Module):
         self.head_dim = args.dim // args.n_heads
         self.in_proj = nn.Linear(args.dim, 3 * args.n_heads * self.head_dim, bias=False)
         self.out_proj = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
-        self.pos_embed = RotaryWithCast(self.head_dim, args.seq_len)
+        # self.pos_embed = RotaryWithCast(self.head_dim, args.seq_len)
         self.attn_fn = xformers_attn
         self.apply_qk_norm = args.apply_qk_norm
 
+        '''
         # initialize weights by trunc_normal(1/sqrt(fan_in))
         std = 1.0 / math.sqrt(args.dim)
         torch.nn.init.trunc_normal_(self.in_proj.weight, std=std, a=-3 * std, b=3 * std)
@@ -99,6 +101,13 @@ class CustomAttn(nn.Module):
         torch.nn.init.trunc_normal_(
             self.out_proj.weight, std=std, a=-3 * std, b=3 * std
         )
+        '''
+        proj_std = (args.dim ** -0.5) * ((2 * args.n_layers) ** -0.5)
+        attn_std = args.dim ** -0.5
+
+        torch.nn.init.normal_(self.in_proj.weight, std=attn_std)
+        torch.nn.init.normal_(self.out_proj.weight, std=proj_std)
+
 
         # set attn mask
         if attn_mask is not None:
@@ -136,7 +145,7 @@ class CustomAttn(nn.Module):
         keys = keys.view(batchsize, seqlen, self.n_heads, self.head_dim)
         vals = vals.view(batchsize, seqlen, self.n_heads, self.head_dim)
 
-        queries, keys, vals = self.pos_embed(queries, keys, vals)
+        # queries, keys, vals = self.pos_embed(queries, keys, vals)
 
         output = self.attn_fn(queries, keys, vals, attn_mask=self.attn_mask)
 
@@ -152,11 +161,14 @@ class Block(nn.Module):
         self.dim = args.dim
         self.head_dim = args.dim // args.n_heads
         self.attention = CustomAttn(layer_id, args, attn_mask)
+        # self.attention = nn.MultiheadAttention(args.dim, args.n_heads)
 
         # this follows llama / lit llama -- go to multiple of 256
-        hidden_dim = 256 * ((int(2 * 4 * args.dim / 3) + 256 - 1) // 256)
+        # hidden_dim = 256 * ((int(2 * 4 * args.dim / 3) + 256 - 1) // 256)
 
+        '''
         self.feed_forward = xops.SwiGLU(args.dim, hidden_dim, args.dim, bias=False)
+        '''
         self.layer_id = layer_id
         self.attention_norm = args.norm_type(
             args.dim,
@@ -168,6 +180,23 @@ class Block(nn.Module):
         )
         self.attention.seq_len = args.seq_len
 
+        mlp_width = int(args.dim * 4)
+        self.feed_forward = nn.Sequential(OrderedDict([
+            ("c_fc", nn.Linear(args.dim, mlp_width)),
+            ("gelu", nn.GELU()),
+            ("c_proj", nn.Linear(mlp_width, args.dim))
+        ]))
+
+        '''
+        # set attn mask
+        if attn_mask is not None:
+            self.register_buffer('attn_mask', attn_mask, persistent=False)
+        else:
+            self.attn_mask = None
+        '''
+
+
+        '''
         # initialize weights trunc_normal(1/sqrt(fan_in))
         std = 1.0 / math.sqrt(args.dim)
         torch.nn.init.trunc_normal_(
@@ -179,9 +208,28 @@ class Block(nn.Module):
         torch.nn.init.trunc_normal_(
             self.feed_forward.w3.weight, std=std, a=-3 * std, b=3 * std
         )
+        '''
+        fc_std = (2 * args.dim) ** -0.5
+        attn_std = args.dim ** -0.5
+        proj_std = (args.dim ** -0.5) * ((2 * args.n_layers) ** -0.5)
+
+        # torch.nn.init.normal_(self.attention.in_proj_weight, std=attn_std)
+        # torch.nn.init.normal_(self.attention.out_proj.weight, std=proj_std)
+
+        torch.nn.init.normal_(self.feed_forward.c_fc.weight, std=fc_std)
+        torch.nn.init.normal_(self.feed_forward.c_proj.weight, std=proj_std)
+
 
     def forward(self, x):
         h = x + self.attention(self.attention_norm(x))
+        '''
+        attn_mask = self.attn_mask.to(x.dtype) if self.attn_mask is not None else None
+
+        q_x = self.attention_norm(x)
+        k_x, v_x = q_x, q_x
+
+        h = x + self.attention(q_x, k_x, v_x, need_weights=False, attn_mask=attn_mask)[0]
+        '''
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
 
@@ -211,10 +259,12 @@ class Transformer(nn.Module):
             self.layers.append(Block(layer_id, params, attn_mask))
 
         # get class for normalization layers
+        '''
         self.norm = params.norm_type(
             params.dim,
             eps=params.norm_eps,
         )
+        '''
         # self.output = nn.Linear(params.dim, params.vocab_size, bias=False)
         # if self.weight_tying:
         #     self.tok_embeddings.weight = self.output.weight
@@ -243,7 +293,7 @@ class Transformer(nn.Module):
             else:
                 x = layer(x)
 
-        x = self.norm(x)
+        # x = self.norm(x)
         # output = self.output(x)
         # follow llama in casting this to float.
         # return output.float(), x

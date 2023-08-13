@@ -1,255 +1,113 @@
-import math
-import json
-import re
-from copy import deepcopy
 from collections import OrderedDict
-from pathlib import Path
-from dataclasses import dataclass
+import math
+from typing import Callable, Optional, Sequence, Tuple
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
 
-import xformers.ops as xops
-from xformers.components.positional_embedding import RotaryEmbedding
 
-# from openclip
-_MODEL_CONFIG_PATHS = [Path(__file__).parent / f"model_configs/"]
-_MODEL_CONFIGS = {}  # directory (model_name: config) of model architecture configs
-
-
-def _natural_key(string_):
-    return [int(s) if s.isdigit() else s for s in re.split(r"(\d+)", string_.lower())]
-
-
-def _rescan_model_configs():
-    global _MODEL_CONFIGS
-
-    config_ext = (".json",)
-    config_files = []
-    for config_path in _MODEL_CONFIG_PATHS:
-        if config_path.is_file() and config_path.suffix in config_ext:
-            config_files.append(config_path)
-        elif config_path.is_dir():
-            for ext in config_ext:
-                config_files.extend(config_path.glob(f"*{ext}"))
-
-    for cf in config_files:
-        with open(cf, "r") as f:
-            model_cfg = json.load(f)
-            _MODEL_CONFIGS[cf.stem] = model_cfg
-
-    _MODEL_CONFIGS = {
-        k: v
-        for k, v in sorted(_MODEL_CONFIGS.items(), key=lambda x: _natural_key(x[0]))
-    }
-
-
-_rescan_model_configs()  # initial populate of model config registry
-
-
-# args and default params follow llama (except with LayerNorm instead of RmsNorm)
-@dataclass
-class Params:
-    dim: int = 512
-    n_layers: int = 8
-    n_heads: int = 8
-    norm_eps: float = 1e-5
-    seq_len: int = 2048
-    post_embed_norm: bool = False
-    norm_type: nn.Module = nn.LayerNorm
-    apply_qk_norm: bool = False
-
-
-class RotaryWithCast(RotaryEmbedding):
-    def forward(self, q, k, v):
-        q, k = super().forward(q, k)
-        return q.to(v.dtype), k.to(v.dtype), v
-
-
-def xformers_attn(queries, keys, values, attn_mask):
-    # TODO: maybe this is too slow
-    # not sure how to make it so attn_maks doesn't change stride during forward
-    if attn_mask is not None and attn_mask.shape[0] % 8 != 0:
-        seq_len = attn_mask.shape[0]
-        closest_8k = math.ceil(seq_len/8) * 8
-        big_attn_mask = torch.zeros((closest_8k, closest_8k), device=attn_mask.device, dtype=attn_mask.dtype)
-        big_attn_mask[:seq_len, :seq_len] = attn_mask
-        attn_mask = big_attn_mask[:seq_len, :seq_len]
-    return xops.memory_efficient_attention(queries, keys, values, attn_bias=attn_mask)
-
-
-class CustomAttn(nn.Module):
-    def __init__(self, layer_id, args: Params, attn_mask=None):
-        super().__init__()
-        self.n_heads = args.n_heads
-        self.head_dim = args.dim // args.n_heads
-        self.in_proj = nn.Linear(args.dim, 3 * args.n_heads * self.head_dim, bias=False)
-        self.out_proj = nn.Linear(args.n_heads * self.head_dim, args.dim, bias=False)
-        # self.pos_embed = RotaryWithCast(self.head_dim, args.seq_len)
-        self.attn_fn = xformers_attn
-        self.apply_qk_norm = args.apply_qk_norm
-
-        # initialize weights by trunc_normal(1/sqrt(fan_in))
-        std = 1.0 / math.sqrt(args.dim)
-        torch.nn.init.trunc_normal_(self.in_proj.weight, std=std, a=-3 * std, b=3 * std)
-        # scale init by depth as in https://arxiv.org/abs/1908.11365 -- worked slightly better.
-        std = std / math.sqrt(2 * (layer_id + 1))
-        torch.nn.init.trunc_normal_(
-            self.out_proj.weight, std=std, a=-3 * std, b=3 * std
-        )
-        '''
-        proj_std = (args.dim ** -0.5) * ((2 * args.n_layers) ** -0.5)
-        attn_std = args.dim ** -0.5
-
-        torch.nn.init.normal_(self.in_proj.weight, std=attn_std)
-        torch.nn.init.normal_(self.out_proj.weight, std=proj_std)
-        '''
-
-        # set attn mask
-        if attn_mask is not None:
-            self.register_buffer('attn_mask', attn_mask, persistent=False)
-        else:
-            self.attn_mask = None
-
-        # initialize norm layers for queries and keys if needed
-        self.q_norm = (
-            args.norm_type(
-                args.n_heads * self.head_dim,
-                eps=args.norm_eps,
-            )
-            if self.apply_qk_norm
-            else nn.Identity()
-        )
-        self.k_norm = (
-            args.norm_type(
-                args.n_heads * self.head_dim,
-                eps=args.norm_eps,
-            )
-            if self.apply_qk_norm
-            else nn.Identity()
-        )
+class LayerNorm(nn.LayerNorm):
+    """Subclass torch's LayerNorm (with cast back to input dtype)."""
 
     def forward(self, x: torch.Tensor):
-        batchsize, seqlen, _ = x.shape
-        queries, keys, vals = self.in_proj(x).chunk(3, dim=-1)
-
-        queries = self.q_norm(queries)
-        keys = self.k_norm(keys)
-
-        queries = queries.view(batchsize, seqlen, self.n_heads, self.head_dim)
-        keys = keys.view(batchsize, seqlen, self.n_heads, self.head_dim)
-        vals = vals.view(batchsize, seqlen, self.n_heads, self.head_dim)
-
-        # queries, keys, vals = self.pos_embed(queries, keys, vals)
-
-        output = self.attn_fn(queries, keys, vals, attn_mask=self.attn_mask)
-
-        output = output.view(batchsize, seqlen, -1)
-
-        return self.out_proj(output)
+        orig_type = x.dtype
+        x = F.layer_norm(x, self.normalized_shape, self.weight, self.bias, self.eps)
+        return x.to(orig_type)
 
 
-class Block(nn.Module):
-    def __init__(self, layer_id, args: Params, attn_mask=None):
+class ResidualAttentionBlock(nn.Module):
+    def __init__(
+            self,
+            d_model: int,
+            n_head: int,
+            mlp_ratio: float = 4.0,
+            ls_init_value: float = None,
+            act_layer: Callable = nn.GELU,
+            norm_layer: Callable = LayerNorm,
+            is_cross_attention: bool = False,
+    ):
         super().__init__()
-        self.n_heads = args.n_heads
-        self.dim = args.dim
-        self.head_dim = args.dim // args.n_heads
-        self.attention = CustomAttn(layer_id, args, attn_mask)
 
-        # this follows llama / lit llama -- go to multiple of 256
-        # hidden_dim = 256 * ((int(2 * 4 * args.dim / 3) + 256 - 1) // 256)
+        self.ln_1 = norm_layer(d_model)
+        self.attn = nn.MultiheadAttention(d_model, n_head)
+        self.ls_1 = LayerScale(d_model, ls_init_value) if ls_init_value is not None else nn.Identity()
+        if is_cross_attention:
+            self.ln_1_kv = norm_layer(d_model)
 
-        # self.feed_forward = xops.SwiGLU(args.dim, hidden_dim, args.dim, bias=False)
-        self.layer_id = layer_id
-        self.attention_norm = args.norm_type(
-            args.dim,
-            eps=args.norm_eps,
-        )
-        self.ffn_norm = args.norm_type(
-            args.dim,
-            eps=args.norm_eps,
-        )
-        self.attention.seq_len = args.seq_len
-
-        '''
-        # initialize weights trunc_normal(1/sqrt(fan_in))
-        std = 1.0 / math.sqrt(args.dim)
-        torch.nn.init.trunc_normal_(
-            self.feed_forward.w12.weight, std=std, a=-3 * std, b=3 * std
-        )
-        # scale init by depth as in https://arxiv.org/abs/1908.11365 -- worked slightly better.
-        std = 1.0 / math.sqrt(hidden_dim)
-        std = std / math.sqrt(2 * (layer_id + 1))
-        torch.nn.init.trunc_normal_(
-            self.feed_forward.w3.weight, std=std, a=-3 * std, b=3 * std
-        )
-        '''
-        mlp_width = int(args.dim * 4)
-        self.feed_forward = nn.Sequential(OrderedDict([
-            ("c_fc", nn.Linear(args.dim, mlp_width)),
-            ("gelu", nn.GELU()),
-            ("c_proj", nn.Linear(mlp_width, args.dim))
+        self.ln_2 = norm_layer(d_model)
+        mlp_width = int(d_model * mlp_ratio)
+        self.mlp = nn.Sequential(OrderedDict([
+            ("c_fc", nn.Linear(d_model, mlp_width)),
+            ("gelu", act_layer()),
+            ("c_proj", nn.Linear(mlp_width, d_model))
         ]))
+        self.ls_2 = LayerScale(d_model, ls_init_value) if ls_init_value is not None else nn.Identity()
 
-        fc_std = (2 * args.dim) ** -0.5
-        attn_std = args.dim ** -0.5
-        proj_std = (args.dim ** -0.5) * ((2 * args.n_layers) ** -0.5)
+    def attention(
+            self,
+            q_x: torch.Tensor,
+            k_x: Optional[torch.Tensor] = None,
+            v_x: Optional[torch.Tensor] = None,
+            attn_mask: Optional[torch.Tensor] = None,
+    ):
+        k_x = k_x if k_x is not None else q_x
+        v_x = v_x if v_x is not None else q_x
 
-        torch.nn.init.normal_(self.feed_forward.c_fc.weight, std=fc_std)
-        torch.nn.init.normal_(self.feed_forward.c_proj.weight, std=proj_std)
+        attn_mask = attn_mask.to(q_x.dtype) if attn_mask is not None else None
+        return self.attn(
+            q_x, k_x, v_x, need_weights=False, attn_mask=attn_mask
+        )[0]
 
+    def forward(
+            self,
+            q_x: torch.Tensor,
+            k_x: Optional[torch.Tensor] = None,
+            v_x: Optional[torch.Tensor] = None,
+            attn_mask: Optional[torch.Tensor] = None,
+    ):
+        k_x = self.ln_1_kv(k_x) if hasattr(self, "ln_1_kv") and k_x is not None else None
+        v_x = self.ln_1_kv(v_x) if hasattr(self, "ln_1_kv") and v_x is not None else None
 
-    def forward(self, x):
-        h = x + self.attention(self.attention_norm(x))
-        out = h + self.feed_forward(self.ffn_norm(h))
-        return out
+        x = q_x + self.ls_1(self.attention(q_x=self.ln_1(q_x), k_x=k_x, v_x=v_x, attn_mask=attn_mask))
+        x = x + self.ls_2(self.mlp(self.ln_2(x)))
+        return x
+
 
 
 class Transformer(nn.Module):
-    def __init__(self, params, attn_mask=None):
+    def __init__(
+            self,
+            width: int,
+            layers: int,
+            heads: int,
+            mlp_ratio: float = 4.0,
+            ls_init_value: float = None,
+            act_layer: Callable = nn.GELU,
+            norm_layer: Callable = LayerNorm,
+    ):
         super().__init__()
-        # for convenience we often share param names with llama
-        self.params = params
-        self.n_layers = params.n_layers
-        self.seq_len = params.seq_len
-        self.post_embed_norm = (
-            params.norm_type(
-                params.dim,
-                eps=params.norm_eps,
-            )
-            if params.post_embed_norm
-            else nn.Identity()
-        )
-
-        self.layers = torch.nn.ModuleList()
-        for layer_id in range(params.n_layers):
-            self.layers.append(Block(layer_id, params, attn_mask))
-
+        self.width = width
+        self.layers = layers
         self.grad_checkpointing = False
 
-        # get class for normalization layers
-        '''
-        self.norm = params.norm_type(
-            params.dim,
-            eps=params.norm_eps,
-        )
-        '''
+        self.resblocks = nn.ModuleList([
+            ResidualAttentionBlock(
+                width, heads, mlp_ratio, ls_init_value=ls_init_value, act_layer=act_layer, norm_layer=norm_layer)
+            for _ in range(layers)
+        ])
 
-    @torch.jit.ignore
-    def set_grad_checkpointing(self, enable=True):
-        self.grad_checkpointing = enable
+    def get_cast_dtype(self) -> torch.dtype:
+        if hasattr(self.resblocks[0].mlp.c_fc, 'int8_original_dtype'):
+            return self.resblocks[0].mlp.c_fc.int8_original_dtype
+        return self.resblocks[0].mlp.c_fc.weight.dtype
 
-    def forward(self, x):
-        # x = self.tok_embeddings(input)
-        x = self.post_embed_norm(x)
-
-        for layer in self.layers:
-            if self.grad_checkpointing:
-                x = checkpoint(layer, x)
+    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None):
+        for r in self.resblocks:
+            if self.grad_checkpointing and not torch.jit.is_scripting():
+                # TODO: handle kwargs https://github.com/pytorch/pytorch/issues/79887#issuecomment-1161758372
+                x = checkpoint(r, x, None, None, attn_mask)
             else:
-                x = layer(x)
-
-        # x = self.norm(x)
+                x = r(x, attn_mask=attn_mask)
         return x

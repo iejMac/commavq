@@ -8,8 +8,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from distributed import is_master
-# from transformer import Transformer
-from transformer_gpt import Transformer, Params
+from transformer import Transformer, Params
 
 
 def sinusoidal_positional_embedding(token_sequence_size, token_embedding_dim, n=10000.0):
@@ -112,9 +111,7 @@ class Encoder(nn.Module):
         t_embs = embs + p_embs
         # t_embs = embs
 
-        # t_embs = t_embs.permute(1, 0, 2)  # NLD -> LND
         c_embs = self.transformer(t_embs)
-        # c_embs = c_embs.permute(1, 0, 2)  # LND -> NLD
 
         # c_embs = self.ln_final(c_embs)
         c_embs = self.proj(c_embs)
@@ -157,8 +154,7 @@ class Decoder(nn.Module):
             seq_len=n_input_tokens,
             post_embed_norm=False,
         )
-        # self.transformer = Transformer(transformer_params, attn_mask=attn_mask)
-        self.transformer = Transformer(transformer_params)
+        self.transformer = Transformer(transformer_params, attn_mask=attn_mask)
 
         self.final_proj = None
         self.pred_head = nn.Linear(width, 1024, bias=False)
@@ -255,10 +251,8 @@ class Decoder(nn.Module):
 
         fx = fx + p_embs
 
-        # fx = fx.permute(1, 0, 2)  # NLD -> LND
-        # y = self.transformer(fx, attn_mask=self.attn_mask)
         y = self.transformer(fx)
-        # y = y.permute(1, 0, 2)  # LND -> NLD 
+
         if self.final_proj is not None:
             y = self.final_proj(y)
 

@@ -59,8 +59,9 @@ def compute_usage_loss(model, X, split="train", autocast=suppress):
         fake_encodings = torch.randint(0, model.quantizer.n_embeddings, (xs.shape[0], model.n_dynamics_tokens * (model.encoder.n_frames - 1))).long().to(X.device)
         fake_f = model.diff_proj(model.quantizer.embedding.weight[fake_encodings])
         fake_xs = torch.randint(0, 1024, xs.shape).long().to(X.device)
-        f = model.diff_proj(model.encode_diff(X))
+        f = model.encode_diff(X)
         f, _, _, _ = model.quantizer(f)
+        f = model.diff_proj(f)
         fake_f_logits = model.decode(xs, fake_f)
         fake_xs_logits = model.decode(fake_xs, f)
 

@@ -276,6 +276,7 @@ class Quantizer(nn.Module):
         self.commitment_cost = commitment_cost
         self.usage_threshold = usage_threshold
 
+        self.norm = lambda x: F.normalize(x, dim=-1)
         self.embedding = nn.Embedding(n_embeddings, embedding_dim)
 
         # Counter variable which contains the number of times each codebook is used
@@ -284,7 +285,8 @@ class Quantizer(nn.Module):
         self.init_parameters()
 
     def init_parameters(self):
-        self.embedding.weight.data.uniform_(-1/self.n_embeddings, 1/self.n_embeddings)
+        # self.embedding.weight.data.uniform_(-1/self.n_embeddings, 1/self.n_embeddings)
+        self.embedding.weight.data.normal_()
 
     def reinit_unused_codebook(self, dist_args=None):
         # TODO: cleanup dist code
@@ -319,12 +321,16 @@ class Quantizer(nn.Module):
         self.codebook_used *= 0.0
 
     def forward(self, f_emb):
+        assert f_emb.shape[-1] == self.embedding_dim
         flat_input = f_emb.reshape(-1, self.embedding_dim)
 
+        flat_input_norm = self.norm(flat_input)
+        embedding_norm = self.norm(self.embedding.weight)
+
         # Calculate distances
-        distances = (torch.sum(flat_input**2, dim=1, keepdim=True) 
-                    + torch.sum(self.embedding.weight**2, dim=1)
-                    - 2 * torch.matmul(flat_input, self.embedding.weight.t()))
+        distances = (torch.sum(flat_input_norm**2, dim=1, keepdim=True) 
+                    + torch.sum(embedding_norm**2, dim=1)
+                    - 2 * torch.matmul(flat_input_norm, embedding_norm.t()))
             
         # Encoding
         encoding_indices = torch.argmin(distances, dim=1).unsqueeze(1)
@@ -337,6 +343,7 @@ class Quantizer(nn.Module):
 
         # Quantize and unflatten
         quantized = torch.matmul(encodings, self.embedding.weight).reshape(f_emb.shape)
+        quantized, f_emb = self.norm(quantized), self.norm(f_emb)
 
         e_latent_loss = F.mse_loss(quantized.detach(), f_emb)
         q_latent_loss = F.mse_loss(quantized, f_emb.detach())

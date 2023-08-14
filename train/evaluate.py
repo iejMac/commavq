@@ -64,6 +64,16 @@ def compute_usage_loss(model, X, split="train", autocast=suppress):
         fake_f_logits = model.decode(xs, fake_f)
         fake_xs_logits = model.decode(fake_xs, f)
 
+        # Check usage of trajectory
+        if X.shape[1] > 2:
+            fake_fnm1 = fake_f.clone()
+            fake_fnm1[:, -128:] = f[:, -128:] 
+            fake_fnm1_logits = model.decode(xs, fake_fnm1)[:, -128:]
+            fake_fnm1_prep_logits = fake_fnm1_logits.reshape(-1, 1024)
+            prep_xn_labels = X[:, -1:].reshape(X.shape[0], -1).reshape(-1)
+            unused_fnm1_loss = F.cross_entropy(fake_fnm1_prep_logits, prep_xn_labels)
+            usage_log[f"{split}/unused_fnm1_loss"] = unused_fnm1_loss.item()
+
         fake_f_prep_logits = fake_f_logits.reshape(-1, 1024)
         fake_xs_prep_logits = fake_xs_logits.reshape(-1, 1024)
         unused_f_loss = F.cross_entropy(fake_f_prep_logits, prep_labels)

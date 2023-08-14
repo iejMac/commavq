@@ -93,6 +93,7 @@ def evaluate_model(model, val_dataloader, n_steps, autocast=suppress):
 
     ns = [1]
     if model.encoder.n_frames > 2:
+        val_log["val/unused_fnm1_loss"] = 0.0
         ns.append(model.encoder.n_frames - 1)
 
     for n in ns:

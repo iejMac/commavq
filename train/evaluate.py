@@ -1,7 +1,9 @@
 import torch
 import torch.distributed as dist
 
+from contextlib import suppress
 from torch.nn import functional as F
+from model import N_FRAME_TOKENS
 
 from distributed import is_master
 
@@ -22,64 +24,86 @@ def compute_perplexity(model, args):
         return perplexity
 
 
-def compute_acc_metrics(pred, X, split="train"):
+def compute_acc_metrics(pred, X, ns=[1], split="train"):
     acc_log = {}
 
-    x0 = X[:, 0].reshape(X.shape[0], -1).long()
-    x1 = X[:, 1].reshape(X.shape[0], -1).long()
 
-    pred_eq_x0 = (pred == x0)
-    pred_eq_x1 = (pred == x1)
-    x0_eq_x1 = (x0 == x1)
+    for n in ns:
+        xn = X[:, n].reshape(X.shape[0], -1).long()
+        xnm1 = X[:, n-1].reshape(X.shape[0], -1).long()
+        pred_n = pred[:, (n-1)*N_FRAME_TOKENS:(n)*N_FRAME_TOKENS]
 
-    pred_x0_acc = (pred_eq_x0).sum()/x0.numel()
-    pred_x1_acc = (pred_eq_x1).sum()/x1.numel()
-    pred_x1_n_x0_acc = (pred_eq_x1 * ~(x0_eq_x1)).sum()/(x1.numel() - x0_eq_x1.sum())
-    x0_x1_eq = (x0_eq_x1).sum()/x1.numel()
-    
-    acc_log[f"{split}/pred_x0_acc"] = pred_x0_acc.item()
-    acc_log[f"{split}/pred_x1_acc"] = pred_x1_acc.item()
-    acc_log[f"{split}/pred_x1_n_x0_acc"] = pred_x1_n_x0_acc.item()
-    acc_log[f"{split}/x0_x1_eq"] = x0_x1_eq.item()
+        pred_xn_eq_xnm1 = (pred_n == xnm1)
+        pred_eq_xn = (pred_n == xn)
+        xnm1_eq_xn = (xnm1 == xn)
 
+        pred_xn_xnm1_acc = (pred_xn_eq_xnm1).sum()/xnm1.numel()
+        pred_xn_acc = (pred_eq_xn).sum()/xn.numel()
+        pred_xn_n_xnm1_acc = (pred_eq_xn * ~(xnm1_eq_xn)).sum()/(xn.numel() - xnm1_eq_xn.sum())
+        xnm1_xn_eq = (xnm1_eq_xn).sum()/xn.numel()
+        
+        acc_log[f"{split}/pred_x{n}_x{n-1}_acc"] = pred_xn_xnm1_acc.item()
+        acc_log[f"{split}/pred_x{n}_acc"] = pred_xn_acc.item()
+        acc_log[f"{split}/pred_x{n}_n_x{n-1}_acc"] = pred_xn_n_xnm1_acc.item()
+        acc_log[f"{split}/x{n-1}_x{n}_eq"] = xnm1_xn_eq.item()
     return acc_log
 
 
-def compute_usage_loss(model, X, split="train"):
+def compute_usage_loss(model, X, split="train", autocast=suppress):
     usage_log = {}
-    x0 = X[:, 0].reshape(X.shape[0], -1).long()
+    xs = X[:, :-1].long()
+    xs = xs.reshape(xs.shape[0], xs.shape[1], -1)
     prep_labels = X[:, 1:].reshape(X.shape[0], -1).reshape(-1)
     
-    with torch.no_grad():
-        fake_f = torch.randn((X.shape[0], model.n_dynamics_tokens, model.width)).to(X.device)
-        fake_x0 = torch.randint(0, 1024, x0.shape).long().to(X.device)
+    with torch.no_grad(), autocast():
+        fake_encodings = torch.randint(0, model.quantizer.n_embeddings, (xs.shape[0], model.n_dynamics_tokens * (model.encoder.n_frames - 1))).long().to(X.device)
+        fake_f = model.diff_proj(model.quantizer.embedding.weight[fake_encodings])
+        fake_xs = torch.randint(0, 1024, xs.shape).long().to(X.device)
         f = model.diff_proj(model.encode_diff(X))
-        fake_f_logits = model.decode(x0, fake_f)
-        fake_x0_logits = model.decode(fake_x0, f)
+        f, _, _, _ = model.quantizer(f)
+        fake_f_logits = model.decode(xs, fake_f)
+        fake_xs_logits = model.decode(fake_xs, f)
+
+        # Check usage of trajectory
+        if X.shape[1] > 2:
+            fake_fnm1 = fake_f.clone()
+            fake_fnm1[:, -128:] = f[:, -128:] 
+            fake_fnm1_logits = model.decode(xs, fake_fnm1)[:, -128:]
+            fake_fnm1_prep_logits = fake_fnm1_logits.reshape(-1, 1024)
+            prep_xn_labels = X[:, -1:].reshape(X.shape[0], -1).reshape(-1)
+            unused_fnm1_loss = F.cross_entropy(fake_fnm1_prep_logits, prep_xn_labels)
+            usage_log[f"{split}/unused_fnm1_loss"] = unused_fnm1_loss.item()
 
         fake_f_prep_logits = fake_f_logits.reshape(-1, 1024)
-        fake_x0_prep_logits = fake_x0_logits.reshape(-1, 1024)
+        fake_xs_prep_logits = fake_xs_logits.reshape(-1, 1024)
         unused_f_loss = F.cross_entropy(fake_f_prep_logits, prep_labels)
-        unused_x0_loss = F.cross_entropy(fake_x0_prep_logits, prep_labels)
+        unused_xs_loss = F.cross_entropy(fake_xs_prep_logits, prep_labels)
         usage_log[f"{split}/unused_f_loss"] = unused_f_loss.item()
-        usage_log[f"{split}/unused_x0_loss"] = unused_x0_loss.item()
+        usage_log[f"{split}/unused_xs_loss"] = unused_xs_loss.item()
 
     return usage_log 
 
 
-def evaluate_model(model, val_dataloader, n_steps):
+def evaluate_model(model, val_dataloader, n_steps, autocast=suppress):
     val_log = {
         "val/reco_loss": 0.0,
         "val/unused_f_loss": 0.0,
-        "val/unused_x0_loss": 0.0,
-        "val/pred_x0_acc": 0.0,
-        "val/pred_x1_acc": 0.0,
-        "val/pred_x1_n_x0_acc": 0.0,
-        "val/x0_x1_eq": 0.0,
+        "val/unused_xs_loss": 0.0,
     }
 
+    ns = [1]
+    if model.encoder.n_frames > 2:
+        val_log["val/unused_fnm1_loss"] = 0.0
+        ns.append(model.encoder.n_frames - 1)
+
+    for n in ns:
+        val_log[f"val/pred_x{n}_x{n-1}_acc"] = 0.0
+        val_log[f"val/pred_x{n}_acc"] = 0.0
+        val_log[f"val/pred_x{n}_n_x{n-1}_acc"] = 0.0
+        val_log[f"val/x{n-1}_x{n}_eq"] = 0.0
+
     i = 0
-    with torch.no_grad():
+    with torch.no_grad(), autocast():
         for X in val_dataloader:
             if i >= n_steps:
                 break
@@ -94,8 +118,8 @@ def evaluate_model(model, val_dataloader, n_steps):
             reco_loss = F.cross_entropy(prep_logits, prep_labels)
             step_log["val/reco_loss"] = reco_loss.item()
 
-            step_log.update(compute_acc_metrics(true_logits.argmax(dim=-1), X, "val"))
-            step_log.update(compute_usage_loss(model, X, "val"))
+            step_log.update(compute_acc_metrics(true_logits.argmax(dim=-1), X, ns, "val"))
+            step_log.update(compute_usage_loss(model, X, "val", autocast=autocast))
 
             for k, v in step_log.items():
                 val_log[k] += v

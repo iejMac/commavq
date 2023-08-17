@@ -16,7 +16,7 @@ from torch import optim
 
 from dataloader import TokenLoader
 from distributed import is_master, init_distributed_device
-from evaluate import compute_acc_metrics, compute_usage_loss, compute_perplexity, evaluate_model
+from evaluate import compute_acc_metrics, compute_usage_loss, compute_perplexity, evaluate_model, check_compression_acc
 from model import VQVideo, EncoderConfig, DecoderConfig, QuantizerConfig, N_FRAME_TOKENS
 from params import parse_args
 
@@ -226,6 +226,8 @@ def main(args):
                 log.update(usage_log)
             if (args.val_frequency != -1) and (i % args.val_frequency == 0):
                 mod = model.module if args.distributed else model
+                comp_log = check_compression_acc(mod, val_dataloader, args, autocast=autocast)
+                log.update(comp_log)
                 val_log = evaluate_model(mod, val_dataloader, args.val_steps, autocast=autocast)
                 log.update(val_log)
             model.train()

@@ -130,3 +130,57 @@ def evaluate_model(model, val_dataloader, n_steps, autocast=suppress):
         val_log[k] /= n_steps
     
     return val_log
+
+
+def check_compression_acc(model, val_dataloader, args, autocast=suppress):
+    '''
+    Compress the video into interleaved frames and diff codes, then decompress and check accuracy
+
+    Compressed representation should look like: [x0, f0, f1, ... f_nframes-1, x_nframes, ...]
+    Decompressed: [x0, x1, x2, ...]
+
+    Compression ratio: N_FRAME_TOKENS * n_frames / (n_dynamics_tokens * (n_frames - 1) + N_FRAME_TOKENS)
+    '''
+    acc_log = {
+        "val/full_video_acc": 0.0,
+    }
+
+    vid_ind = torch.randint(0, val_dataloader.ds.shape[1], (1,))
+    vid = torch.Tensor(val_dataloader.ds[0, vid_ind]).reshape(-1, N_FRAME_TOKENS).long()
+
+    chunked_vid = torch.stack(vid.split(args.n_frames, dim=0)[:-int(vid.shape[0] % args.n_frames != 0)])
+
+    # TODO: make batched
+
+    with torch.no_grad(), autocast():
+        # Store first frame from each chunk and diff codes
+        x0s, diff_codes = [], []
+        for c in range(chunked_vid.shape[0]):
+            chunk = chunked_vid[c:c+1].to(model.device)
+            x0s.append(chunk[:, 0])
+
+            enc_diff = model.encode_diff(chunk)
+            quantized, ll, ppl, encodings = model.quantizer(enc_diff)
+            quantized = model.diff_proj(quantized).reshape(1, -1, model.n_dynamics_tokens, quantized.shape[-1])
+            diff_codes.append(quantized)
+
+        # From x0s and diff_codes reconstruct X
+        rec = []
+        for i in range(len(x0s)):
+            x = torch.cat([x0s[i] for _ in range(args.n_frames-1)])[None, ...]  # repeat so dims match
+            diffs = diff_codes[i]
+
+            rec.append(x0s[i])
+
+            for f in range(args.n_frames-1):
+                reco = model.decode(x, diffs)
+                pred = reco[:, f*N_FRAME_TOKENS:(f+1)*N_FRAME_TOKENS].argmax(dim=-1).long()
+                if f < args.n_frames - 2:
+                    x[:, f+1] = pred
+                rec.append(pred)
+
+    rec_ = torch.cat(rec).cpu()
+    vid_ = vid[:rec_.shape[0]]
+    acc_log["val/full_video_acc"] = ((rec_ == vid_).sum()/rec_.numel()).item()
+
+    return acc_log

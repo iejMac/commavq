@@ -198,14 +198,15 @@ class Decoder(nn.Module):
         # torch.nn.init.normal_(self.pred_head.weight, mean=0.0, std=proj_std)
 
     def build_attention_mask(self, f, t, n):
-        '''
+        seq_len = n * (f + t + 2)
+
+        block_size = f + t + 2
         # block level
         mask = torch.full((seq_len, seq_len), float('-inf'))
         # Block diagonal mask should have ones (i.e., zero out after fill with '-inf')
         for i in range(0, seq_len, block_size):
             mask[i:i+block_size, :i+block_size] = 0  # unmask block diagonal
         '''
-        seq_len = n * (f + t + 2)
         mask = torch.full((seq_len, seq_len), float('-inf'))
 
         # Allow each token to attend to itself by default
@@ -232,6 +233,7 @@ class Decoder(nn.Module):
             next_d_start = f_start + f
             mask[f_start:f_start+f, next_d_start:next_d_start+t+1] = 0
 
+        '''
         return mask
         
     def forward(self, x, f):
